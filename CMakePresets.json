@@ -1,0 +1,56 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "default",
+      "displayName": "Default (STD platform, TiMS IPC, Release)",
+      "description": "Standard Linux platform with RACK/TiMS IPC. Use inside the dev container or when all dependencies are installed locally.",
+      "inherits": "base"
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (STD platform)",
+      "description": "Standard Linux platform, Debug build.",
+      "inherits": "default",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "evl",
+      "displayName": "EVL platform (in-container compile-check)",
+      "description": "EVL/Xenomai 4 platform + EVL IPC backend. Requires libevl installed system-wide (present in the RaTOS dev container).",
+      "inherits": "base",
+      "cacheVariables": {
+        "CORERAT_PLATFORM": "EVL",
+        "CORERAT_IPC": "AUTO"
+      }
+    },
+    {
+      "name": "evl-cross",
+      "displayName": "EVL build against RaTOS SDK",
+      "description": "Build for the RaTOS EVL target using the RaTOS ISAR SDK sysroot. Set EVL_SDK_DIR to the SDK root (default: .evl-cache/sdk). See CommRaT/scripts/evl-dev.sh.",
+      "inherits": "base",
+      "toolchainFile": "${sourceDir}/cmake/isar-sdk-toolchain.cmake",
+      "cacheVariables": {
+        "CORERAT_PLATFORM": "EVL",
+        "CORERAT_IPC": "AUTO"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default",   "configurePreset": "default"   },
+    { "name": "debug",     "configurePreset": "debug"     },
+    { "name": "evl",       "configurePreset": "evl"       },
+    { "name": "evl-cross", "configurePreset": "evl-cross" }
+  ]
+}

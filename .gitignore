@@ -1,0 +1,24 @@
+# Build output
+build/
+
+# EVL test artifacts cache (QEMU images, SDK, etc.)
+.evl-cache/
+
+# Local environment overrides (non-secret; never commit)
+.corerat.env.local
+
+# Reference submodule / symlinks (not part of CoreRaT itself)
+CommRaT
+/tims
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Generated
+*.o
+*.a
+*.so
+compile_commands.json
