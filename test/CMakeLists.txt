@@ -40,16 +40,28 @@ if(CORERAT_BUILD_ROUTERS)
     set_tests_properties(test_router_tcp PROPERTIES
         TIMEOUT 15
         LABELS  "integration")
+endif()
 
-    # ---- Ping-pong integration test ----
-    add_executable(ping_node ping_pong/ping_node.cpp)
-    target_link_libraries(ping_node PRIVATE corerat)
-    target_include_directories(ping_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ping_pong)
+# ============================================================================
+# Ping-pong integration test — cross-process, same source for TIMS + EVL
+# ============================================================================
 
-    add_executable(pong_node ping_pong/pong_node.cpp)
-    target_link_libraries(pong_node PRIVATE corerat)
-    target_include_directories(pong_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ping_pong)
+add_executable(ping_node ping_pong/ping_node.cpp)
+target_link_libraries(ping_node PRIVATE corerat)
+if(CORERAT_IPC STREQUAL "TIMS")
+    target_link_libraries(ping_node PRIVATE corerat_tims)
+endif()
+target_include_directories(ping_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ping_pong)
 
+add_executable(pong_node ping_pong/pong_node.cpp)
+target_link_libraries(pong_node PRIVATE corerat)
+if(CORERAT_IPC STREQUAL "TIMS")
+    target_link_libraries(pong_node PRIVATE corerat_tims)
+endif()
+target_include_directories(pong_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ping_pong)
+
+if(CORERAT_IPC STREQUAL "TIMS" AND CORERAT_BUILD_ROUTERS)
+    # TIMS: start router + two processes
     add_test(NAME test_pingpong
         COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_pingpong_test.sh
             $<TARGET_FILE:corerat-router-tcp>
@@ -57,6 +69,30 @@ if(CORERAT_BUILD_ROUTERS)
             $<TARGET_FILE:ping_node>
             100)
     set_tests_properties(test_pingpong PROPERTIES
+        TIMEOUT 30
+        LABELS  "integration")
+elseif(CORERAT_IPC STREQUAL "EVL")
+    # EVL: direct SHM ring — no router on the data path
+    add_test(NAME test_pingpong
+        COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_pingpong_test.sh
+            ""
+            $<TARGET_FILE:pong_node>
+            $<TARGET_FILE:ping_node>
+            100)
+    set_tests_properties(test_pingpong PROPERTIES
+        TIMEOUT 30
+        LABELS  "integration")
+endif()
+
+# ---- EVL single-binary LOCAL-mode latency benchmark ----
+if(CORERAT_PLATFORM STREQUAL "EVL")
+    add_executable(evl_pingpong ping_pong/evl_pingpong.cpp)
+    target_link_libraries(evl_pingpong PRIVATE corerat)
+    target_include_directories(evl_pingpong PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ping_pong)
+
+    add_test(NAME test_evl_pingpong
+        COMMAND $<TARGET_FILE:evl_pingpong> --count 100)
+    set_tests_properties(test_evl_pingpong PROPERTIES
         TIMEOUT 30
         LABELS  "integration")
 endif()

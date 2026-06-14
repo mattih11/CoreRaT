@@ -8,28 +8,28 @@
  *
  *   LOCAL  — single-process / multi-thread (default).
  *            Ring buffer lives in heap memory.
- *            `evl_detail::registry_slot[]` is the entire routing table.
+ *            Routing via evl_detail::registry_slot[] (process-local pointer table).
  *
  *   PUBLIC — cross-process.
  *            Ring buffer lives in a POSIX SHM region ("/corerat_mbx_<id>").
+ *            SlotMeta[] is stored inside the SHM so senders in other processes
+ *            can post directly without any IPC copy step.
  *            EVL mutex/event created with EVL_CLONE_PUBLIC — any process can
- *            open them by name via evl_open_mutex / evl_open_event.
- *            The EvlRouter name-service daemon maps mailbox_id → resource names
- *            so senders in other processes can attach without prior coordination.
+ *            open them by name.  Names are deterministic from mailbox_id so
+ *            no name-service (evl-router) lookup is needed on the data path.
+ *
+ * SHM layout (PUBLIC mode):
+ *   [ShmLayout (16 bytes)] [SlotMeta × capacity] [payload × capacity × slot_size]
  *
  * Hot-path OOB operations (no mode switch):
- *   send:    evl_lock → memcpy → mark in_use → evl_unlock → evl_signal
- *   receive: evl_timedwait/evl_wait → memcpy → mark free  → evl_unlock
- *
- * Priority model mirrors the TiMS kernel module:
- *   Higher value = higher priority.
- *   When the ring is full, the lowest-priority message is evicted if the new
- *   message has equal or higher priority.
+ *   send:    evl_lock → find/evict slot → memcpy → mark in_use → evl_unlock → evl_signal
+ *   receive: evl_timedwait/evl_wait → memcpy → mark free → evl_unlock
  */
 
 #include "corerat/ipc/tims/tims_backend.hpp"   // TimsConfig, TimsResult
 #include "corerat/messaging/wire_message.hpp"
 #include "corerat/platform/duration.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -63,14 +63,12 @@ namespace evl_detail {
 inline constexpr uint32_t kMaxMailboxes = 256;
 
 /// Process-local registry: mailbox_id → EvlMailbox* (LOCAL mode only).
-/// Written only at initialize()/shutdown() — not hot path.
 inline EvlMailbox*& registry_slot(uint32_t id) noexcept {
     static EvlMailbox* reg[kMaxMailboxes]{};
     return reg[id % kMaxMailboxes];
 }
 
 /// Build an EVL object name into a fixed buffer.
-/// Returns a null-terminated string_view into buf.
 inline std::string_view evl_name(char (&buf)[64],
                                   std::string_view prefix,
                                   uint32_t id) noexcept {
@@ -80,12 +78,27 @@ inline std::string_view evl_name(char (&buf)[64],
     return { buf, static_cast<std::string_view::size_type>(n) };
 }
 
-/// SHM path for a mailbox (POSIX shm_open name).
+/// POSIX shm_open name for a mailbox (PUBLIC mode).
 inline std::string_view shm_name(char (&buf)[64], uint32_t id) noexcept {
     return evl_name(buf, "/corerat_mbx_", id);
 }
 
 }  // namespace evl_detail
+
+// ============================================================================
+// SHM layout header
+//
+// Stored at offset 0 of the SHM region in PUBLIC mode.  Written once by the
+// creator; senders in other processes read it to learn capacity/slot_size.
+// ============================================================================
+
+struct ShmLayout {
+    uint32_t capacity;
+    uint32_t slot_size;
+    uint32_t _pad[2];    // pad to 16 bytes
+};
+
+static_assert(sizeof(ShmLayout) == 16, "ShmLayout must be 16 bytes");
 
 // ============================================================================
 // EvlMailbox
@@ -138,6 +151,8 @@ public:
     void shutdown() {
         if (!created_) return;
 
+        close_all_remotes();
+
         if (mode_ == Mode::Local &&
             evl_detail::registry_slot(config_.mailbox_id) == this)
             evl_detail::registry_slot(config_.mailbox_id) = nullptr;
@@ -186,7 +201,7 @@ public:
 
 private:
     // ========================================================================
-    // Slot metadata — stored separately from payload data for cache locality
+    // SlotMeta — stored in ring (SHM in PUBLIC mode, heap in LOCAL mode)
     // ========================================================================
 
     struct SlotMeta {
@@ -195,6 +210,34 @@ private:
         uint32_t src{0};
         uint32_t size{0};
     };
+
+    // ========================================================================
+    // Accessors that dispatch on mode
+    // ========================================================================
+
+    SlotMeta& slot_meta_at(uint32_t idx) noexcept {
+        if (mode_ == Mode::Public && shm_base_) {
+            return reinterpret_cast<SlotMeta*>(
+                static_cast<uint8_t*>(shm_base_) + sizeof(ShmLayout))[idx];
+        }
+        return slot_meta_[idx];
+    }
+
+    uint8_t* slot_ptr(uint32_t idx) noexcept {
+        if (mode_ == Mode::Public && shm_base_) {
+            return static_cast<uint8_t*>(shm_base_)
+                   + sizeof(ShmLayout)
+                   + capacity_ * sizeof(SlotMeta)
+                   + idx * slot_size_;
+        }
+        return heap_data_.get() + idx * slot_size_;
+    }
+
+    static std::size_t shm_total(uint32_t cap, uint32_t slot_sz) noexcept {
+        return sizeof(ShmLayout)
+             + static_cast<std::size_t>(cap) * sizeof(SlotMeta)
+             + static_cast<std::size_t>(cap) * slot_sz;
+    }
 
     // ========================================================================
     // Ring buffer allocation
@@ -208,20 +251,24 @@ private:
             shm_fd_ = ::shm_open(name.data(), O_CREAT | O_RDWR, 0600);
             if (shm_fd_ < 0) return false;
 
-            const std::size_t data_sz = static_cast<std::size_t>(slots) * slot_size;
-            if (::ftruncate(shm_fd_, static_cast<off_t>(data_sz)) < 0) {
+            const std::size_t total = shm_total(slots, slot_size);
+            if (::ftruncate(shm_fd_, static_cast<off_t>(total)) < 0) {
                 ::close(shm_fd_); shm_fd_ = -1;
                 return false;
             }
-            void* p = ::mmap(nullptr, data_sz,
+            void* p = ::mmap(nullptr, total,
                              PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
             if (p == MAP_FAILED) {
                 ::close(shm_fd_); shm_fd_ = -1;
                 return false;
             }
-            shm_data_      = static_cast<uint8_t*>(p);
-            shm_data_size_ = data_sz;
-            slot_meta_     = std::make_unique<SlotMeta[]>(slots);
+            shm_base_ = p;
+            shm_size_ = total;
+
+            // Write layout header (rest is zero-initialised by mmap)
+            auto* layout = static_cast<ShmLayout*>(shm_base_);
+            layout->capacity  = slots;
+            layout->slot_size = slot_size;
         } else {
             // LOCAL: plain heap
             slot_meta_ = std::make_unique<SlotMeta[]>(slots);
@@ -234,9 +281,9 @@ private:
     }
 
     void free_ring() noexcept {
-        if (mode_ == Mode::Public && shm_data_) {
-            ::munmap(shm_data_, shm_data_size_);
-            shm_data_ = nullptr;
+        if (shm_base_) {
+            ::munmap(shm_base_, shm_size_);
+            shm_base_ = nullptr;
             char name_buf[64];
             const auto name = evl_detail::shm_name(name_buf, config_.mailbox_id);
             ::shm_unlink(name.data());
@@ -247,11 +294,6 @@ private:
         capacity_ = slot_size_ = 0;
     }
 
-    uint8_t* slot_ptr(int idx) noexcept {
-        auto* base = (mode_ == Mode::Public) ? shm_data_ : heap_data_.get();
-        return base + static_cast<std::size_t>(idx) * slot_size_;
-    }
-
     // ========================================================================
     // EVL object creation / destruction
     // ========================================================================
@@ -259,9 +301,9 @@ private:
     bool create_evl_objects() noexcept {
 #ifdef CORERAT_PLATFORM_EVL
         evl_init();
-        const int flags = (mode_ == Mode::Public)
-                        ? (EVL_MUTEX_NORMAL | EVL_CLONE_PUBLIC)
-                        : (EVL_MUTEX_NORMAL | EVL_CLONE_PRIVATE);
+        const int flags  = (mode_ == Mode::Public)
+                         ? (EVL_MUTEX_NORMAL | EVL_CLONE_PUBLIC)
+                         : (EVL_MUTEX_NORMAL | EVL_CLONE_PRIVATE);
         const int eflags = (mode_ == Mode::Public)
                          ? EVL_CLONE_PUBLIC
                          : EVL_CLONE_PRIVATE;
@@ -290,27 +332,28 @@ private:
     }
 
     // ========================================================================
-    // Slot helpers
+    // Ring slot helpers (use slot_meta_at() for mode-transparent access)
     // ========================================================================
 
-    int find_free_slot() const noexcept {
+    int find_free_slot() noexcept {
         for (uint32_t i = 0; i < capacity_; ++i)
-            if (!slot_meta_[i].in_use) return static_cast<int>(i);
+            if (!slot_meta_at(i).in_use) return static_cast<int>(i);
         return -1;
     }
 
-    bool has_in_use_slot() const noexcept {
+    bool has_in_use_slot() noexcept {
         for (uint32_t i = 0; i < capacity_; ++i)
-            if (slot_meta_[i].in_use) return true;
+            if (slot_meta_at(i).in_use) return true;
         return false;
     }
 
-    int find_highest_priority_slot() const noexcept {
+    int find_highest_priority_slot() noexcept {
         int    best = -1;
         int8_t prio = INT8_MIN;
         for (uint32_t i = 0; i < capacity_; ++i) {
-            if (slot_meta_[i].in_use && slot_meta_[i].priority > prio) {
-                prio = slot_meta_[i].priority;
+            auto& m = slot_meta_at(i);
+            if (m.in_use && m.priority > prio) {
+                prio = m.priority;
                 best = static_cast<int>(i);
             }
         }
@@ -321,21 +364,22 @@ private:
         int    worst = -1;
         int8_t prio  = INT8_MAX;
         for (uint32_t i = 0; i < capacity_; ++i) {
-            if (slot_meta_[i].in_use && slot_meta_[i].priority < prio) {
-                prio  = slot_meta_[i].priority;
+            auto& m = slot_meta_at(i);
+            if (m.in_use && m.priority < prio) {
+                prio  = m.priority;
                 worst = static_cast<int>(i);
             }
         }
         if (worst >= 0 && prio_new >= prio) {
-            slot_meta_[worst].in_use = false;
+            slot_meta_at(worst).in_use = false;
             return worst;
         }
         return -1;
     }
 
     // ========================================================================
-    // post() — write into THIS ring; called by sender via send_raw()
-    // OOB-safe: only EVL primitives + memcpy inside the lock.
+    // post() — write into THIS mailbox's ring (OOB-safe)
+    // Called by the owning process or by send_raw() for LOCAL same-process sends.
     // ========================================================================
 
     bool post(const void* data, std::size_t size,
@@ -353,7 +397,7 @@ private:
         }
 
         std::memcpy(slot_ptr(idx), data, size);
-        slot_meta_[idx] = SlotMeta{ priority, true, src, static_cast<uint32_t>(size) };
+        slot_meta_at(idx) = SlotMeta{ priority, true, src, static_cast<uint32_t>(size) };
 
 #ifdef CORERAT_PLATFORM_EVL
         evl_unlock_mutex(&ring_mutex_);
@@ -363,9 +407,143 @@ private:
     }
 
     // ========================================================================
-    // send_raw() — look up dest ring and call post()
-    // LOCAL: direct registry_slot lookup.
-    // PUBLIC: registry_slot lookup first; name-based open as fallback (Phase 3).
+    // Remote handle — opened on demand for PUBLIC cross-process sends.
+    //
+    // Names are fully deterministic from dest_id, so no evl-router lookup is
+    // needed on the data path:
+    //   SHM:   /corerat_mbx_<dest_id>
+    //   mutex: corerat-ring-mtx-<dest_id>
+    //   event: corerat-ring-evt-<dest_id>
+    //
+    // ShmLayout is mapped to discover the ring dimensions, then SlotMeta[] and
+    // payload[] are accessed inside the same mmap region.
+    // ========================================================================
+
+    struct RemoteHandle {
+        uint32_t    dest_id{0};
+        void*       shm_base{nullptr};  // mmap of remote ring
+        std::size_t shm_size{0};
+        int         shm_fd{-1};
+        bool        valid{false};
+#ifdef CORERAT_PLATFORM_EVL
+        struct evl_mutex mutex{};
+        struct evl_event event{};
+#endif
+    };
+
+    static constexpr uint32_t kMaxRemoteHandles = 16;
+    std::array<RemoteHandle, kMaxRemoteHandles> remote_handles_{};
+
+    RemoteHandle* get_or_open_remote(uint32_t dest) noexcept {
+        for (auto& h : remote_handles_)
+            if (h.valid && h.dest_id == dest) return &h;
+        for (auto& h : remote_handles_)
+            if (!h.valid) { return open_remote(h, dest) ? &h : nullptr; }
+        return nullptr;  // cache full
+    }
+
+    bool open_remote(RemoteHandle& h, uint32_t dest) noexcept {
+        char name_buf[64];
+        evl_detail::shm_name(name_buf, dest);
+
+        // Receiver must have called initialize() already
+        const int fd = ::shm_open(name_buf, O_RDWR, 0);
+        if (fd < 0) return false;
+
+        // Read layout header to learn ring dimensions
+        ShmLayout layout{};
+        if (::pread(fd, &layout, sizeof(layout), 0)
+                != static_cast<ssize_t>(sizeof(layout))) {
+            ::close(fd); return false;
+        }
+
+        const std::size_t total = shm_total(layout.capacity, layout.slot_size);
+        void* p = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) { ::close(fd); return false; }
+
+#ifdef CORERAT_PLATFORM_EVL
+        evl_detail::evl_name(name_buf, "corerat-ring-mtx-", dest);
+        if (evl_open_mutex(&h.mutex, "%s", name_buf) < 0) {
+            ::munmap(p, total); ::close(fd); return false;
+        }
+        evl_detail::evl_name(name_buf, "corerat-ring-evt-", dest);
+        if (evl_open_event(&h.event, "%s", name_buf) < 0) {
+            evl_close_mutex(&h.mutex); ::munmap(p, total); ::close(fd); return false;
+        }
+#endif
+        h.dest_id  = dest;
+        h.shm_base = p;
+        h.shm_size = total;
+        h.shm_fd   = fd;
+        h.valid    = true;
+        return true;
+    }
+
+    void close_all_remotes() noexcept {
+        for (auto& h : remote_handles_) {
+            if (!h.valid) continue;
+#ifdef CORERAT_PLATFORM_EVL
+            evl_close_event(&h.event);
+            evl_close_mutex(&h.mutex);
+#endif
+            ::munmap(h.shm_base, h.shm_size);
+            ::close(h.shm_fd);
+            h = RemoteHandle{};
+        }
+    }
+
+    /// Post directly into a remote process's ring buffer via its mapped SHM.
+    bool post_to_remote(RemoteHandle& h, const void* data,
+                        std::size_t size, int8_t priority) noexcept {
+        auto* layout  = static_cast<ShmLayout*>(h.shm_base);
+        auto* meta    = reinterpret_cast<SlotMeta*>(
+                            static_cast<uint8_t*>(h.shm_base) + sizeof(ShmLayout));
+        auto* pbase   = static_cast<uint8_t*>(h.shm_base)
+                      + sizeof(ShmLayout)
+                      + layout->capacity * sizeof(SlotMeta);
+
+#ifdef CORERAT_PLATFORM_EVL
+        evl_lock_mutex(&h.mutex);
+#endif
+        // Find free slot or evict lowest-priority message
+        int idx = -1;
+        for (uint32_t i = 0; i < layout->capacity; ++i) {
+            if (!meta[i].in_use) { idx = static_cast<int>(i); break; }
+        }
+        if (idx < 0) {
+            int worst = -1; int8_t wprio = INT8_MAX;
+            for (uint32_t i = 0; i < layout->capacity; ++i) {
+                if (meta[i].in_use && meta[i].priority < wprio) {
+                    wprio = meta[i].priority;
+                    worst = static_cast<int>(i);
+                }
+            }
+            if (worst >= 0 && priority >= wprio) {
+                meta[worst].in_use = false;
+                idx = worst;
+            }
+        }
+        if (idx < 0) {
+#ifdef CORERAT_PLATFORM_EVL
+            evl_unlock_mutex(&h.mutex);
+#endif
+            return false;
+        }
+
+        const auto sz = std::min(size, static_cast<std::size_t>(layout->slot_size));
+        std::memcpy(pbase + idx * layout->slot_size, data, sz);
+        meta[idx] = SlotMeta{ priority, true, config_.mailbox_id,
+                              static_cast<uint32_t>(sz) };
+
+#ifdef CORERAT_PLATFORM_EVL
+        evl_unlock_mutex(&h.mutex);
+        evl_signal_event(&h.event);
+#endif
+        return true;
+    }
+
+    // ========================================================================
+    // send_raw() — dispatches LOCAL (registry lookup) vs PUBLIC (cross-process)
     // ========================================================================
 
     TimsResult send_raw(const void* data, std::size_t size,
@@ -373,13 +551,28 @@ private:
         if (!data || size == 0 || size > config_.max_msg_size)
             return TimsResult::ERROR_INVALID_MSG;
 
-        EvlMailbox* target = evl_detail::registry_slot(dest);
-        if (!target || target->get_mailbox_id() != dest || !target->created_)
-            return TimsResult::ERROR_SEND;
+        bool ok = false;
 
-        if (!target->post(data, size, priority, config_.mailbox_id))
-            return TimsResult::ERROR_SEND;
+        if (mode_ == Mode::Public) {
+            // Same-process shortcut (both mailboxes are PUBLIC, same process)
+            EvlMailbox* local = evl_detail::registry_slot(dest);
+            if (local && local->get_mailbox_id() == dest && local->created_) {
+                ok = local->post(data, size, priority, config_.mailbox_id);
+            } else {
+                // Cross-process: open remote SHM + EVL handles by deterministic name
+                RemoteHandle* rh = get_or_open_remote(dest);
+                if (!rh) return TimsResult::ERROR_SEND;
+                ok = post_to_remote(*rh, data, size, priority);
+            }
+        } else {
+            // LOCAL: process-local registry only
+            EvlMailbox* target = evl_detail::registry_slot(dest);
+            if (!target || target->get_mailbox_id() != dest || !target->created_)
+                return TimsResult::ERROR_SEND;
+            ok = target->post(data, size, priority, config_.mailbox_id);
+        }
 
+        if (!ok) return TimsResult::ERROR_SEND;
         messages_sent_.fetch_add(1, std::memory_order_relaxed);
         return TimsResult::SUCCESS;
     }
@@ -422,28 +615,28 @@ private:
             }
         }
 
-        const int idx      = find_highest_priority_slot();
-        const uint8_t* src = slot_ptr(idx);
-        const auto     sz  = static_cast<std::size_t>(slot_meta_[idx].size);
+        const int      idx = find_highest_priority_slot();
+        const auto&    sm  = slot_meta_at(idx);
+        const auto     sz  = static_cast<std::size_t>(sm.size);
 
         if (sz > buffer.size()) {
             evl_unlock_mutex(&ring_mutex_);
             return -EMSGSIZE;
         }
 
-        std::memcpy(buffer.data(), src, sz);
+        std::memcpy(buffer.data(), slot_ptr(idx), sz);
 
         if (meta) {
             WireHeader hdr{};
-            if (sz >= sizeof(WireHeader)) std::memcpy(&hdr, src, sizeof(WireHeader));
-            meta->src      = slot_meta_[idx].src;
+            if (sz >= sizeof(WireHeader)) std::memcpy(&hdr, buffer.data(), sizeof(WireHeader));
+            meta->src      = sm.src;
             meta->dest     = config_.mailbox_id;
             meta->seq_nr   = hdr.seq_number;
-            meta->priority = static_cast<uint8_t>(slot_meta_[idx].priority);
+            meta->priority = static_cast<uint8_t>(sm.priority);
             meta->flags    = static_cast<uint8_t>(hdr.flags);
         }
 
-        slot_meta_[idx].in_use = false;
+        slot_meta_at(idx).in_use = false;
         evl_unlock_mutex(&ring_mutex_);
 
         messages_received_.fetch_add(1, std::memory_order_relaxed);
@@ -469,415 +662,18 @@ private:
     struct evl_event ring_event_{};
 #endif
 
-    // Ring buffer — heap (LOCAL) or SHM (PUBLIC)
-    std::unique_ptr<SlotMeta[]> slot_meta_;
-    std::unique_ptr<uint8_t[]>  heap_data_;   // LOCAL only
-    uint8_t*                    shm_data_{nullptr};  // PUBLIC only
-    std::size_t                 shm_data_size_{0};
+    // Ring storage
+    std::unique_ptr<SlotMeta[]> slot_meta_;   // LOCAL: heap meta array
+    std::unique_ptr<uint8_t[]>  heap_data_;   // LOCAL: heap payload
+    void*                       shm_base_{nullptr};  // PUBLIC: mmap base (header+meta+payload)
+    std::size_t                 shm_size_{0};
     int                         shm_fd_{-1};
-    uint32_t                    capacity_{0};
-    uint32_t                    slot_size_{0};
+
+    uint32_t capacity_{0};
+    uint32_t slot_size_{0};
+
+    // Remote handle cache for PUBLIC cross-process sends
+    std::array<RemoteHandle, kMaxRemoteHandles> remote_handles_{};
 };
 
 }  // namespace corerat
-
- *
- * Drop-in replacement for TimsMailbox when CORERAT_IPC=EVL.
- *
- * Each EvlMailbox owns a priority-sorted slot ring (heap-allocated at initialize()).
- * All hot-path operations are OOB-safe:
- *   send:    evl_lock → memcpy → mark in_use → evl_unlock → evl_signal
- *   receive: evl_timedwait/evl_wait → memcpy → mark free  → evl_unlock
- *
- * The ring is stored in heap memory (single-process).
- * Cross-process IPC (memfd + name service) is deferred to Phase 3.
- *
- * Priority model: mirrors the TiMS kernel module.
- *   Higher priority value = higher priority.
- *   When the ring is full, the lowest-priority message is dropped if the new
- *   message has equal or higher priority.
- *
- * STATUS: Phase 2 — single-process implementation complete.
- */
-
-// EvlMailbox reuses TimsConfig and TimsResult so Mailbox<> needs no changes.
-#include "corerat/ipc/tims/tims_backend.hpp"
-#include "corerat/messaging/wire_message.hpp"
-#include "corerat/platform/duration.hpp"
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <cstdio>
-#include <span>
-#include <unistd.h>
-
-#ifdef CORERAT_PLATFORM_EVL
-#include <evl/evl.h>
-#include <evl/mutex.h>
-#include <evl/event.h>
-#include <evl/clock.h>
-#endif
-
-namespace corerat {
-
-// ============================================================================
-// Forward declaration for process-local registry
-// ============================================================================
-
-class EvlMailbox;
-
-namespace evl_detail {
-
-inline constexpr uint32_t kMaxMailboxes = 256;
-
-/// Process-local registry mapping mailbox_id → EvlMailbox* (Meyers singleton).
-/// Written only at initialize()/shutdown() (init/teardown, not hot path).
-inline EvlMailbox*& registry_slot(uint32_t id) noexcept {
-    static EvlMailbox* reg[kMaxMailboxes]{};
-    return reg[id % kMaxMailboxes];
-}
-
-}  // namespace evl_detail
-
-// ============================================================================
-// EvlMailbox
-// ============================================================================
-
-class EvlMailbox {
-public:
-    /// Metadata compatible with TimsMailbox::TimsMetadata / Metadata
-    struct Metadata {
-        uint32_t src{0};
-        uint32_t dest{0};
-        uint32_t seq_nr{0};
-        uint8_t  priority{0};
-        uint8_t  flags{0};
-    };
-
-    explicit EvlMailbox(const TimsConfig& config) : config_(config) {}
-
-    ~EvlMailbox() { shutdown(); }
-
-    EvlMailbox(const EvlMailbox&) = delete;
-    EvlMailbox& operator=(const EvlMailbox&) = delete;
-
-    EvlMailbox(EvlMailbox&& other) noexcept
-        : config_(std::move(other.config_))
-        , created_(other.created_)
-        , messages_sent_(other.messages_sent_.load())
-        , messages_received_(other.messages_received_.load())
-        , slot_meta_(other.slot_meta_)
-        , slot_data_(other.slot_data_)
-        , capacity_(other.capacity_)
-        , slot_size_(other.slot_size_) {
-        // EVL objects cannot be moved after creation; only allow pre-create moves
-        other.created_   = false;
-        other.slot_meta_ = nullptr;
-        other.slot_data_ = nullptr;
-    }
-
-    EvlMailbox& operator=(EvlMailbox&& other) noexcept {
-        if (this != &other) {
-            shutdown();
-            config_            = std::move(other.config_);
-            created_           = other.created_;
-            messages_sent_     = other.messages_sent_.load();
-            messages_received_ = other.messages_received_.load();
-            slot_meta_         = other.slot_meta_;
-            slot_data_         = other.slot_data_;
-            capacity_          = other.capacity_;
-            slot_size_         = other.slot_size_;
-            other.created_   = false;
-            other.slot_meta_ = nullptr;
-            other.slot_data_ = nullptr;
-        }
-        return *this;
-    }
-
-    // ========================================================================
-    // Lifecycle — same interface as TimsMailbox
-    // ========================================================================
-
-    TimsResult initialize() {
-        if (created_) return TimsResult::SUCCESS;
-
-        constexpr uint32_t kSlots = 10;
-        const uint32_t slot_size  = static_cast<uint32_t>(config_.max_msg_size);
-
-        slot_meta_ = new SlotMeta[kSlots]{};
-        slot_data_ = new uint8_t[kSlots * slot_size]{};
-        capacity_  = kSlots;
-        slot_size_ = slot_size;
-
-#ifdef CORERAT_PLATFORM_EVL
-        evl_init();
-        char name[64];
-        std::snprintf(name, sizeof(name), "corerat-ring-mtx-%u:%d",
-                      config_.mailbox_id, static_cast<int>(getpid()));
-        if (evl_new_mutex(&ring_mutex_, "%s", name) < 0) {
-            delete[] slot_meta_; slot_meta_ = nullptr;
-            delete[] slot_data_; slot_data_ = nullptr;
-            return TimsResult::ERROR_INIT;
-        }
-        std::snprintf(name, sizeof(name), "corerat-ring-evt-%u:%d",
-                      config_.mailbox_id, static_cast<int>(getpid()));
-        if (evl_new_event(&ring_event_, "%s", name) < 0) {
-            evl_close_mutex(&ring_mutex_);
-            delete[] slot_meta_; slot_meta_ = nullptr;
-            delete[] slot_data_; slot_data_ = nullptr;
-            return TimsResult::ERROR_INIT;
-        }
-#endif
-
-        evl_detail::registry_slot(config_.mailbox_id) = this;
-        created_ = true;
-        return TimsResult::SUCCESS;
-    }
-
-    void shutdown() {
-        if (!created_) return;
-
-        if (evl_detail::registry_slot(config_.mailbox_id) == this)
-            evl_detail::registry_slot(config_.mailbox_id) = nullptr;
-
-#ifdef CORERAT_PLATFORM_EVL
-        evl_close_event(&ring_event_);
-        evl_close_mutex(&ring_mutex_);
-#endif
-        delete[] slot_meta_; slot_meta_ = nullptr;
-        delete[] slot_data_; slot_data_ = nullptr;
-        created_ = false;
-    }
-
-    bool     is_initialized()      const noexcept { return created_; }
-    uint32_t get_mailbox_id()      const noexcept { return config_.mailbox_id; }
-    uint64_t get_messages_sent()   const noexcept {
-        return messages_sent_.load(std::memory_order_relaxed);
-    }
-    uint64_t get_messages_received() const noexcept {
-        return messages_received_.load(std::memory_order_relaxed);
-    }
-
-    // ========================================================================
-    // Send — same template interface as TimsMailbox
-    // ========================================================================
-
-    template<typename T>
-    TimsResult send(T& message, uint32_t dest_mailbox_id) {
-        static_assert(is_wire_message_v<T>, "T must be a CoreRaT WireMessage type");
-        if (!created_) return TimsResult::ERROR_NOT_INIT;
-        auto result = corerat::serialize(message);
-        auto view   = result.view();
-        return send_raw(view.data(), view.size(), dest_mailbox_id,
-                        static_cast<int8_t>(config_.priority));
-    }
-
-    // ========================================================================
-    // Receive — same interface as TimsMailbox
-    // ========================================================================
-
-    ssize_t receive_raw_bytes(std::span<std::byte> buffer, Duration timeout) {
-        return receive_impl(buffer, timeout, nullptr);
-    }
-
-    ssize_t receive_raw_bytes(std::span<std::byte> buffer, Duration timeout,
-                              Metadata* metadata) {
-        return receive_impl(buffer, timeout, metadata);
-    }
-
-private:
-    // ========================================================================
-    // Slot metadata
-    // ========================================================================
-
-    struct SlotMeta {
-        int8_t   priority{0};
-        bool     in_use{false};
-        uint32_t src{0};   // source mailbox ID (for Metadata)
-        uint32_t size{0};  // actual bytes stored in this slot
-    };
-
-    int find_free_slot() const noexcept {
-        for (uint32_t i = 0; i < capacity_; ++i)
-            if (!slot_meta_[i].in_use) return static_cast<int>(i);
-        return -1;
-    }
-
-    bool has_in_use_slot() const noexcept {
-        for (uint32_t i = 0; i < capacity_; ++i)
-            if (slot_meta_[i].in_use) return true;
-        return false;
-    }
-
-    int find_highest_priority_slot() const noexcept {
-        int    best = -1;
-        int8_t prio = INT8_MIN;
-        for (uint32_t i = 0; i < capacity_; ++i) {
-            if (slot_meta_[i].in_use && slot_meta_[i].priority > prio) {
-                prio = slot_meta_[i].priority;
-                best = static_cast<int>(i);
-            }
-        }
-        return best;
-    }
-
-    /// Evict the lowest-priority in-use slot only if prio_new >= its priority.
-    int evict_lowest(int8_t prio_new) noexcept {
-        int    worst = -1;
-        int8_t prio  = INT8_MAX;
-        for (uint32_t i = 0; i < capacity_; ++i) {
-            if (slot_meta_[i].in_use && slot_meta_[i].priority < prio) {
-                prio  = slot_meta_[i].priority;
-                worst = static_cast<int>(i);
-            }
-        }
-        if (worst >= 0 && prio_new >= prio) {
-            slot_meta_[worst].in_use = false;
-            return worst;
-        }
-        return -1;
-    }
-
-    // ========================================================================
-    // post() — write into THIS ring (called by sender via send_raw)
-    // OOB-safe: only EVL primitives + memcpy inside the lock.
-    // ========================================================================
-
-    bool post(const void* data, size_t size, int8_t priority,
-              uint32_t src) noexcept {
-#ifdef CORERAT_PLATFORM_EVL
-        evl_lock_mutex(&ring_mutex_);
-#endif
-        int idx = find_free_slot();
-        if (idx < 0) idx = evict_lowest(priority);
-        if (idx < 0) {
-#ifdef CORERAT_PLATFORM_EVL
-            evl_unlock_mutex(&ring_mutex_);
-#endif
-            return false;  // ring full with higher/equal priority messages
-        }
-
-        uint8_t* slot = slot_data_ + static_cast<size_t>(idx) * slot_size_;
-        std::memcpy(slot, data, size);
-        slot_meta_[idx] = SlotMeta{ priority, true, src,
-                                    static_cast<uint32_t>(size) };
-
-#ifdef CORERAT_PLATFORM_EVL
-        evl_unlock_mutex(&ring_mutex_);
-        evl_signal_event(&ring_event_);
-#endif
-        return true;
-    }
-
-    // ========================================================================
-    // send_raw() — look up dest ring and call post()
-    // ========================================================================
-
-    TimsResult send_raw(const void* data, size_t size,
-                        uint32_t dest, int8_t priority) noexcept {
-        if (!data || size == 0 || size > config_.max_msg_size)
-            return TimsResult::ERROR_INVALID_MSG;
-
-        EvlMailbox* target = evl_detail::registry_slot(dest);
-        if (!target || target->get_mailbox_id() != dest || !target->created_)
-            return TimsResult::ERROR_SEND;
-
-        if (!target->post(data, size, priority, config_.mailbox_id))
-            return TimsResult::ERROR_SEND;
-
-        messages_sent_.fetch_add(1, std::memory_order_relaxed);
-        return TimsResult::SUCCESS;
-    }
-
-    // ========================================================================
-    // receive_impl() — block on THIS ring until a message arrives
-    // ========================================================================
-
-    ssize_t receive_impl(std::span<std::byte> buffer,
-                         Duration timeout, Metadata* meta) noexcept {
-        if (!created_) return -1;
-
-#ifdef CORERAT_PLATFORM_EVL
-        evl_lock_mutex(&ring_mutex_);
-
-        if (!has_in_use_slot()) {
-            if (timeout.is_negative()) {
-                evl_wait_event(&ring_event_, &ring_mutex_);
-            } else {
-                struct timespec now{};
-                evl_read_clock(EVL_CLOCK_MONOTONIC, &now);
-                const int64_t deadline =
-                    static_cast<int64_t>(now.tv_sec)  * 1'000'000'000LL
-                  + static_cast<int64_t>(now.tv_nsec)
-                  + timeout.count_ns();
-                struct timespec abs_ts{};
-                abs_ts.tv_sec  = static_cast<time_t>(deadline / 1'000'000'000LL);
-                abs_ts.tv_nsec = static_cast<long>(deadline % 1'000'000'000LL);
-
-                if (evl_timedwait_event(&ring_event_, &ring_mutex_, &abs_ts)
-                        == -ETIMEDOUT) {
-                    evl_unlock_mutex(&ring_mutex_);
-                    return -ETIMEDOUT;
-                }
-            }
-            if (!has_in_use_slot()) {
-                evl_unlock_mutex(&ring_mutex_);
-                return -1;
-            }
-        }
-
-        const int idx = find_highest_priority_slot();
-        const uint8_t* slot = slot_data_ + static_cast<size_t>(idx) * slot_size_;
-        const size_t   sz   = slot_meta_[idx].size;
-
-        if (sz > buffer.size()) {
-            evl_unlock_mutex(&ring_mutex_);
-            return -EMSGSIZE;
-        }
-
-        std::memcpy(buffer.data(), slot, sz);
-
-        if (meta) {
-            WireHeader hdr{};
-            if (sz >= sizeof(WireHeader)) std::memcpy(&hdr, slot, sizeof(WireHeader));
-            meta->src      = slot_meta_[idx].src;
-            meta->dest     = config_.mailbox_id;
-            meta->seq_nr   = hdr.seq_number;
-            meta->priority = static_cast<uint8_t>(slot_meta_[idx].priority);
-            meta->flags    = static_cast<uint8_t>(hdr.flags);
-        }
-
-        slot_meta_[idx].in_use = false;
-        evl_unlock_mutex(&ring_mutex_);
-
-        messages_received_.fetch_add(1, std::memory_order_relaxed);
-        return static_cast<ssize_t>(sz);
-#else
-        (void)buffer; (void)timeout; (void)meta;
-        return -1;  // EVL platform not enabled
-#endif
-    }
-
-    // ========================================================================
-    // Data members
-    // ========================================================================
-
-    TimsConfig            config_;
-    bool                  created_{false};
-    std::atomic<uint64_t> messages_sent_{0};
-    std::atomic<uint64_t> messages_received_{0};
-
-#ifdef CORERAT_PLATFORM_EVL
-    struct evl_mutex ring_mutex_{};
-    struct evl_event ring_event_{};
-#endif
-
-    SlotMeta* slot_meta_{nullptr};
-    uint8_t*  slot_data_{nullptr};
-    uint32_t  capacity_{0};
-    uint32_t  slot_size_{0};
-};
-
-}  // namespace corerat
-

@@ -98,6 +98,9 @@ struct MailboxConfig {
     size_t   max_message_size = 4096;
     uint8_t  send_priority    = 10;
     bool     realtime         = false;
+    /// EVL only: use Mode::Public (cross-process SHM ring).
+    /// On STD/TIMS this field is ignored — the TCP router handles routing.
+    bool     cross_process    = false;
 };
 
 } // namespace corerat

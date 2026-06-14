@@ -3,38 +3,55 @@
  * @file ping_pong/messages.hpp
  * @brief Shared message definitions for the CoreRaT ping-pong test.
  *
- * Two mailboxes communicate via corerat-router-tcp:
- *   ping_node (0x3001) → MSG_PING → pong_node (0x3002)
- *   pong_node (0x3002) → MSG_PONG → ping_node (0x3001)
+ * Uses MessageDefinition<> and Mailbox<> so the same source compiles against
+ * both IPC backends:
  *
- * The payload structs are packed and appended after the TiMS FrameHeader.
- * Timestamps use std::chrono::steady_clock nanoseconds for RTT measurement.
+ *   CORERAT_IPC_TIMS  — TCP socket → corerat-router-tcp (two processes, port 2000)
+ *   CORERAT_IPC_EVL   — EVL OOB ring buffer → cross-process SHM (no router on
+ *                        data path; deterministic names from mailbox_id)
+ *
+ * The transport is selected at cmake configure time via CORERAT_IPC.
+ * Module code calls Mailbox<>::send() / receive_any_for() regardless of backend.
  */
 
-#include "corerat/ipc/tims/protocol.hpp"
+#include "corerat/ipc/mailbox.hpp"
+#include "corerat/ipc/mailbox_config.hpp"
+#include "corerat/messaging/message_id.hpp"
+#include "corerat/messaging/wire_message.hpp"
 #include <cstdint>
 
 namespace corerat::pingpong {
 
-// Mailbox IDs — in the user-defined range (0x3000–0x3FFF)
+// Mailbox IDs — user-defined range (0x3000–0x3FFF)
 inline constexpr uint32_t PING_MBX_ID = 0x3001;
 inline constexpr uint32_t PONG_MBX_ID = 0x3002;
 
-// Frame type codes (application-defined, non-conflicting with tims_proto)
-inline constexpr int8_t MSG_PING = 1;
-inline constexpr int8_t MSG_PONG = 2;
+// ---- Payloads ----------------------------------------------------------------
 
-// Ping payload — sent by ping_node to pong_node
 struct PingPayload {
-    uint64_t send_ns;   ///< steady_clock timestamp at send (ns)
+    uint64_t send_ns;   ///< steady_clock ns at send (for RTT)
     uint32_t seq;       ///< sequence number
-} __attribute__((packed));
+};
 
-// Pong payload — sent by pong_node back to ping_node
 struct PongPayload {
-    uint64_t echo_ns;   ///< echo of PingPayload::send_ns (for RTT calc)
-    uint64_t pong_ns;   ///< steady_clock timestamp when pong was sent (ns)
+    uint64_t echo_ns;   ///< echo of PingPayload::send_ns
+    uint64_t pong_ns;   ///< steady_clock ns when pong was sent
     uint32_t seq;       ///< echo of PingPayload::seq
-} __attribute__((packed));
+};
+
+// ---- MessageDefinition types -------------------------------------------------
+
+using PingDef = MessageDefinition<PingPayload,
+    MessagePrefix::UserDefined, UserSubPrefix::Data, 1>;
+
+using PongDef = MessageDefinition<PongPayload,
+    MessagePrefix::UserDefined, UserSubPrefix::Data, 2>;
+
+// ---- Mailbox type alias ------------------------------------------------------
+
+using PingPongMailbox = Mailbox<PingDef, PongDef>;
+
+// ---- Generous buffer size for both payload types ----------------------------
+inline constexpr std::size_t kMsgBufSize = 256;
 
 }  // namespace corerat::pingpong

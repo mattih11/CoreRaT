@@ -58,7 +58,13 @@ public:
 
     explicit Mailbox(const MailboxConfig& config)
         : config_(config)
+#ifdef CORERAT_IPC_EVL
+        , tims_(create_backend_config(config),
+                config.cross_process ? IpcMailbox::Mode::Public
+                                     : IpcMailbox::Mode::Local)
+#else
         , tims_(create_backend_config(config))
+#endif
         , running_(false) {
     }
 

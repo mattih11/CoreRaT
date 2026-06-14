@@ -580,7 +580,7 @@ else
     echo FAIL; ((fail++)) || true; cat /tmp/.test_out
 fi
 
-# Ping-pong test
+# Ping-pong test (cross-process, no router needed on EVL)
 printf "  %-50s" "test_pingpong"
 /root/corerat/test/pong_node --count 100 > /tmp/.pong_out 2>&1 &
 PONG_PID=$!
@@ -594,6 +594,16 @@ else
 fi
 kill "$PONG_PID" 2>/dev/null || true
 wait "$PONG_PID" 2>/dev/null || true
+
+# EVL single-binary LOCAL mode latency benchmark
+if [[ -x /root/corerat/test/evl_pingpong ]]; then
+    printf "  %-50s" "test_evl_pingpong"
+    if timeout 20 /root/corerat/test/evl_pingpong --count 100 > /tmp/.test_out 2>&1; then
+        echo PASS; ((ok++)) || true
+    else
+        echo FAIL; ((fail++)) || true; cat /tmp/.test_out
+    fi
+fi
 
 echo ""
 echo "Results: ${ok} passed, ${fail} failed"
