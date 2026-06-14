@@ -562,7 +562,8 @@ while IFS= read -r -d "" t; do
         echo FAIL; ((fail++)) || true; cat /tmp/.test_out
     fi
 done < <(find /root/corerat/test -maxdepth 1 \
-              -name "test_*" -executable -type f -print0 | sort -z)
+              -name "test_*" -not -name "test_router_tcp" \
+              -executable -type f -print0 | sort -z)
 
 # ---- Integration tests (router required) ----
 echo "=== Integration tests ==="
@@ -599,11 +600,11 @@ echo "Results: ${ok} passed, ${fail} failed"
 [[ $fail -eq 0 ]]'
     else
         CTEST_PRESET="${DO_BUILD:-default}"
-        echo "Running ctest --preset ${CTEST_PRESET} on EVL guest..."
+        echo "Running ctest (preset: ${CTEST_PRESET}) on EVL guest..."
         ssh ${SSH_OPTS} root@127.0.0.1 bash -lc "
             set -euo pipefail
             cd /root/CoreRaT
-            ctest --preset ${CTEST_PRESET} 2>&1
+            ctest --preset ${CTEST_PRESET} --output-on-failure 2>&1
         "
     fi
 fi

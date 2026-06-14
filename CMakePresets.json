@@ -52,5 +52,11 @@
     { "name": "debug",     "configurePreset": "debug"     },
     { "name": "evl",       "configurePreset": "evl"       },
     { "name": "evl-cross", "configurePreset": "evl-cross" }
+  ],
+  "testPresets": [
+    { "name": "default",   "configurePreset": "default",   "output": { "outputOnFailure": true } },
+    { "name": "debug",     "configurePreset": "debug",     "output": { "outputOnFailure": true } },
+    { "name": "evl",       "configurePreset": "evl",       "output": { "outputOnFailure": true } },
+    { "name": "evl-cross", "configurePreset": "evl-cross", "output": { "outputOnFailure": true } }
   ]
 }
