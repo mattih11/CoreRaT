@@ -266,73 +266,233 @@ concept IpcMailbox = requires(T mbx, uint32_t id, size_t slots, size_t max_sz) {
 };
 ```
 
-### 5.3 TiMS Backend (compatibility, STD platform)
+### 5.3 MailboxConfig
 
-Thin wrapper over `tims_mbx_create` / `tims_sendmsg` / `tims_recvmsg_timed`. Matches current CommRaT behavior exactly. Used when `CORERAT_PLATFORM_STD` (development, non-RT Linux).
+`MailboxConfig` is defined in `include/corerat/ipc/mailbox_config.hpp`. It is the only configuration type passed to `Mailbox<>`. The `Mailbox<>` constructor maps its fields to the correct backend mode.
+
+```cpp
+struct MailboxConfig {
+    uint32_t mailbox_id;
+    size_t   message_slots    = 10;
+    size_t   max_message_size = 4096;
+    uint8_t  send_priority    = 10;
+    bool     realtime         = false;
+
+    // EVL only: use Mode::Public (cross-process POSIX SHM ring).
+    // TIMS: ignored — the TCP router handles routing regardless.
+    bool     cross_process    = false;
+
+    // EVL only: use Mode::Network (OOB UDP/IPv4, cross-machine RT).
+    // TIMS: ignored.
+    bool     network          = false;
+
+    // Must match top byte of mailbox_id (system_id field).
+    uint8_t  local_system_id  = 0;
+
+    // Route table: one entry per remote host (keyed on system_id).
+    struct NetworkRoute {
+        uint8_t system_id{0};
+        char    ip[16]{};   // IPv4 dotted-decimal
+    };
+    static constexpr uint8_t kMaxNetworkRoutes = 8;
+    std::array<NetworkRoute, kMaxNetworkRoutes> network_routes{};
+    uint8_t  network_route_count{0};
+};
+```
+
+Mode selection priority (EVL platform, in `Mailbox<>` constructor):
+```
+network = true        → Mode::Network  (OOB UDP, cross-machine)
+cross_process = true  → Mode::Public   (SHM ring, cross-process)
+default               → Mode::Local    (heap ring, same-process)
+```
+
+On the STD/TIMS platform, `cross_process`, `network`, and all network fields are ignored.
+
+### 5.4 TiMS Backend (compatibility, STD platform)
+
+Thin wrapper over POSIX TCP sockets implementing the RACK `TimsRouterTcp` wire protocol directly — **no RACK library dependency**. Used when `CORERAT_PLATFORM_STD`.
 
 ```cpp
 // include/corerat/ipc/tims/tims_backend.hpp
 class TimsMailbox {
-    int fd_ = -1;
 public:
-    bool create(uint32_t mailbox_id, size_t slots, size_t max_msg_size);
-    void destroy();
-    bool send(uint32_t dest, const WireHeader& hdr, std::span<const std::byte> payload);
-    ssize_t receive(std::span<std::byte> buffer, int64_t timeout_ns, WireHeader* out_header);
-    bool peek();
+    explicit TimsMailbox(const TimsConfig& config);
+    TimsResult initialize();
+    void       shutdown();
+
+    template<typename T>
+    TimsResult send(T& message, uint32_t dest_mailbox_id);
+
+    ssize_t receive_raw_bytes(std::span<std::byte> buffer, Duration timeout);
+    ssize_t receive_raw_bytes(std::span<std::byte> buffer, Duration timeout, Metadata*);
 };
 ```
 
-### 5.4 EVL Backend (OOB-safe, EVL platform)
+Connects to `corerat-router-tcp` (or the RACK `TimsRouterTcp` daemon) on `localhost:2000`. Wire protocol identical to RACK — existing RACK and CommRaT nodes connect without modification.
 
-EVL does not provide a kernel IPC primitive equivalent to TiMS. The EVL-native backend uses:
-- **Shared memory ring buffer** (one per mailbox) — fixed-capacity, fixed-slot
-- **`evl_mutex`** for ring head/tail protection (PI, OOB-safe)
-- **`evl_event`** for blocking receive notification (OOB-safe wait)
-- **`memfd_create` + `mmap`** for the ring buffer backing (setup only, not in hot path)
+### 5.5 Mailbox addressing
 
-This keeps the entire hot path in OOB:
+Mailbox IDs follow the RACK/TiMS convention. The 32-bit address is split into four 8-bit fields:
 
+```
+ 31      24  23      16  15       8  7        0
+┌──────────┬──────────┬──────────┬──────────┐
+│ system   │  class   │ instance │  local   │
+│   id     │   id     │   id     │   id     │
+└──────────┴──────────┴──────────┴──────────┘
+```
+
+- **system_id** (top byte) — identifies the host machine. Used as the routing key in `Mode::Network` to map mailbox destinations to IP addresses. All mailboxes on one machine share the same `system_id`.
+- **class_id** — the component class (e.g. `0x01` = Ladar, `0x02` = Chassis).
+- **instance_id** — disambiguates multiple components of the same class on the same machine.
+- **local_id** — 0 = command mailbox, others = data/reply mailboxes within a component.
+
+Helper:
+```cpp
+static constexpr uint8_t system_id_of(uint32_t mailbox_id) {
+    return (mailbox_id >> 24) & 0xFF;
+}
+```
+
+### 5.5 EVL Backend (OOB-safe, EVL platform)
+
+EVL does not provide a kernel IPC primitive equivalent to TiMS. The EVL-native backend (`EvlMailbox`) has three operating modes selected at `initialize()` time via `MailboxConfig`:
+
+#### Mode::Local (default)
+- Ring buffer in heap memory, `evl_mutex` + `evl_event` created with `EVL_CLONE_PRIVATE`
+- Routing via a process-local pointer registry (`evl_detail::registry_slot[]`)
+- Use case: single process, multiple threads (CommRaT modules in one binary)
+
+#### Mode::Public (cross_process = true)
+- Ring buffer in a POSIX SHM region (`/corerat_mbx_<id>`)
+- `evl_mutex` + `evl_event` created with `EVL_CLONE_PUBLIC` — any process can open them by name
+- **SHM layout:** `[ShmLayout 16B][SlotMeta × capacity][payload × capacity × slot_size]`
+  - `SlotMeta` is inside the SHM so senders in other processes post directly (no IPC copy)
+- Names are deterministic from `mailbox_id` — no name-service lookup on the data path:
+  - SHM: `/corerat_mbx_<id>`
+  - mutex: `corerat-ring-mtx-<id>`
+  - event: `corerat-ring-evt-<id>`
+- Sender opens remote SHM on first send (cached in `RemoteHandle`, up to 16 entries)
+- Use case: multiple processes on the same machine
+
+Hot-path for both Local and Public:
 ```
 send():
   evl_lock(ring.mutex)         // OOB-safe
-  memcpy(ring.slot, msg)       // OOB-safe
-  ring.head++
+  find free slot / evict lowest-priority
+  memcpy(slot, msg)            // OOB-safe
+  mark slot in_use
   evl_unlock(ring.mutex)       // OOB-safe
   evl_signal(ring.event)       // OOB-safe wake
 
 receive():
-  evl_wait(ring.event, mutex)  // OOB-safe block, no CPU burn
-  memcpy(out, ring.slot)       // OOB-safe
-  ring.tail++
+  evl_lock(ring.mutex)
+  evl_timedwait(ring.event)    // OOB-safe block, no CPU burn
+  find highest-priority slot
+  memcpy(out, slot)            // OOB-safe
+  mark slot free
   evl_unlock(ring.mutex)       // OOB-safe
 ```
+
+#### Mode::Network (network = true)
+See §5.6.
+
+#### Class summary
 
 ```cpp
 // include/corerat/ipc/evl/evl_backend.hpp
 class EvlMailbox {
-    struct Ring {
-        struct evl_mutex  mutex;
-        struct evl_event  event;
-        uint8_t*          buffer;    // mmap'd
-        size_t            slot_size;
-        size_t            capacity;
-        std::atomic<int>  head;
-        std::atomic<int>  tail;
-    };
-    Ring ring_{};
 public:
-    bool create(uint32_t mailbox_id, size_t slots, size_t max_msg_size);
-    void destroy();
-    bool send(uint32_t dest, const WireHeader& hdr, std::span<const std::byte> payload);
-    ssize_t receive(std::span<std::byte> buffer, int64_t timeout_ns, WireHeader* out_header);
-    bool peek();
+    enum class Mode { Local, Public, Network };
+
+    explicit EvlMailbox(const TimsConfig& config,
+                        Mode mode = Mode::Local,
+                        const EvlNetworkConfig& net_config = {});
+
+    TimsResult initialize();
+    void       shutdown();
+
+    template<typename T>
+    TimsResult send(T& message, uint32_t dest_mailbox_id);
+
+    ssize_t receive_raw_bytes(std::span<std::byte> buffer, Duration timeout);
+    ssize_t receive_raw_bytes(std::span<std::byte> buffer, Duration timeout, Metadata*);
 };
 ```
 
-Multi-process note: for cross-process EVL IPC, the ring buffer backing must be in a named POSIX shared memory segment (`shm_open` + `mmap`). Within a single process (all CommRaT modules in one binary), anonymous `memfd_create` is sufficient and simpler.
+### 5.6 Network Mode (OOB UDP, cross-machine)
 
-### 5.5 Mailbox<Registry> — Type-safe front-end (unchanged from CommRaT)
+`Mode::Network` uses the EVL out-of-band UDP/IPv4 stack for cross-machine real-time
+communication — the CoreRaT equivalent of what RACK used RTnet for on Xenomai 3.
+No special NIC driver required; EVL offloads TX to in-band if the driver is not
+OOB-capable, but the calling thread **never demotes** from the OOB stage.
+
+#### EvlNetworkConfig
+
+```cpp
+struct EvlNetworkConfig {
+    static constexpr uint16_t kOobBasePort = 42000;
+    static constexpr uint8_t  kMaxRoutes   = 8;
+
+    struct Route {
+        uint8_t system_id{0};
+        char    ip[16]{};        // IPv4 dotted-decimal, e.g. "10.10.10.11"
+    };
+
+    uint8_t                       local_system_id{0};
+    std::array<Route, kMaxRoutes> routes{};
+    uint8_t                       route_count{0};
+
+    // Port = kOobBasePort + (mailbox_id & 0x7FFF)  → range 42000–74767
+    static constexpr uint16_t port_for(uint32_t mailbox_id) noexcept;
+    // system_id = (mailbox_id >> 24) & 0xFF
+    static constexpr uint8_t  system_id_of(uint32_t mailbox_id) noexcept;
+};
+```
+
+Route table is **one entry per remote host** (keyed on `system_id`), not per mailbox.
+Sending to any `0x01XXXXXX` mailbox automatically routes to the host with `system_id = 1`.
+
+#### MailboxConfig for Network mode
+
+```cpp
+MailboxConfig cfg;
+cfg.mailbox_id        = 0x00012000;   // system_id=0 (this host)
+cfg.local_system_id   = 0;
+cfg.network           = true;
+cfg.network_route_count = 1;
+cfg.network_routes[0] = { .system_id = 1, .ip = "10.10.10.11" };
+```
+
+#### Hot path
+
+```
+initialize():
+  socket(AF_INET, SOCK_DGRAM | SOCK_OOB, 0)
+  bind(INADDR_ANY : port_for(my_mailbox_id))
+  for each route: evl_net_solicit(peer_ip, EVL_NEIGH_PERMANENT)  // prime ARP/route cache once
+
+send(dest):
+  dest_sys = system_id_of(dest)
+  look up Route by dest_sys → get IP
+  dst_port = port_for(dest)
+  oob_sendmsg(sock, {ip, dst_port, wire_data})   // stays OOB
+
+receive():
+  oob_recvmsg(sock, buffer, timeout)             // stays OOB
+```
+
+#### Required host setup (once per machine)
+
+```bash
+evl net -ei eth0               # dedicated RT NIC
+# or, to share a NIC:
+ip link add link eth0 name eth0.42 type vlan id 42
+evl net -ei eth0.42
+```
+
+### 5.7 Mailbox<> — Type-safe front-end (unchanged from CommRaT)
 
 ```cpp
 template<typename... MessageDefs>
@@ -486,23 +646,51 @@ target_link_libraries(commrat PUBLIC CoreRaT::corerat)
 
 ## 8. Migration Path (CommRaT -> CoreRaT)
 
-### Phase 1: Extract (no behavior change)
-1. Copy `platform/` verbatim to CoreRaT, rename namespace `commrat::` -> `corerat::`
-2. Copy `messaging/message_id.hpp`, `message_def.hpp`, `message_registry.hpp` verbatim
-3. Copy `messages.hpp` as `messaging/wire_message.hpp` (rename `TimsHeader`->`WireHeader`, `TimsMessage`->`WireMessage`)
-4. Add `CoreRaTConfig.cmake`, CI, tests — confirm all CommRaT tests still pass with CoreRaT as dep
+> **Status as of this document:** Phases 1–3 are **complete** in CoreRaT. CoreRaT is
+> a fully working library with tests passing. The CommRaT agent's job is to update
+> CommRaT to depend on CoreRaT and remove the migrated code.
 
-### Phase 2: IPC TiMS backend
-1. Move `tims_wrapper.cpp/.hpp` to `corerat/ipc/tims/`
-2. Rename `TimsWrapper` -> `TimsMailbox`, thin the API to the `IpcMailbox` concept
-3. Update CommRaT `Mailbox<>` to template on backend type
-4. Confirm CommRaT tests still pass (STD platform, TiMS IPC)
+### Phase 1 ✅ Extract platform + messaging (complete in CoreRaT)
+All of CommRaT's `platform/` and `messaging/` layers are in CoreRaT under `corerat::`.
+No behavior change — same types, same API, renamed namespace.
 
-### Phase 3: EVL IPC backend
-1. Implement `EvlMailbox` (shared memory ring + `evl_mutex` + `evl_event`)
-2. Add `evl-cross` preset to CoreRaT CMakePresets
-3. Test with CommRaT `evl-cross --test` — the 3 failing tests (`test_3input_fusion`, `test_address_collisions`, `test_timestamp_logic`) should pass because receive is now OOB-safe
-4. Confirm zero CPU burn during blocking receives with `evl ps`
+### Phase 2 ✅ IPC TiMS backend (complete in CoreRaT)
+`TimsMailbox` in CoreRaT replaces CommRaT's `TimsWrapper` with a **self-contained TCP socket
+implementation** — no RACK library (`libtims`) dependency. Wire protocol is identical to RACK's
+`TimsRouterTcp`, so existing RACK nodes and `corerat-router-tcp` are interchangeable.
+
+### Phase 3 ✅ EVL IPC backend (complete in CoreRaT)
+`EvlMailbox` implements three modes:
+- `Mode::Local` — heap ring + EVL mutex/event (single process)
+- `Mode::Public` — POSIX SHM ring + public EVL mutex/event (cross-process, same machine)
+- `Mode::Network` — OOB UDP/IPv4 with system_id-based routing (cross-machine RT)
+
+The three CommRaT tests that were failing due to `tims_recvmsg_timed()` demotion
+(`test_3input_fusion`, `test_address_collisions`, `test_timestamp_logic`) should pass
+once CommRaT uses `EvlMailbox` instead of `TimsWrapper` on the EVL platform.
+
+### Phase 4 — CommRaT agent: wire CommRaT to CoreRaT
+
+This is the remaining work. For the CommRaT agent:
+
+1. **Add `find_package(CoreRaT REQUIRED)` to CommRaT's `CMakeLists.txt`**
+   Remove: `find_package(RACK)`, `find_library(EVL_LIBRARY)`, `find_path(EVL_INCLUDE_DIR)`,
+   `COMMRAT_PLATFORM_*` cmake logic, duplicated platform compile-definitions.
+
+2. **Replace CommRaT's `Mailbox<>` with CoreRaT's**
+   `#include "commrat/mailbox/mailbox.hpp"` → `#include "corerat/ipc/mailbox.hpp"` (alias
+   `using commrat::Mailbox = corerat::Mailbox` in a shim header for backwards compat).
+
+3. **Replace `commrat::TimsConfig` / `TimsWrapper` with `corerat::TimsConfig` / `TimsMailbox`**
+   The `MailboxConfig` → `TimsConfig` conversion already exists in `Mailbox<>::create_backend_config()`.
+
+4. **Update includes for messaging and platform types**
+   `commrat::MessageDefinition`, `WireMessage`, `Duration`, `Time`, etc. all exist in
+   `corerat::` — add aliases or update includes project-wide.
+
+5. **Confirm CommRaT tests pass** on STD (TiMS) platform first, then EVL platform.
+
+6. **Delete migrated files** from CommRaT per §11.
 
 ---
 
