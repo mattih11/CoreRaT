@@ -60,8 +60,10 @@ public:
         : config_(config)
 #ifdef CORERAT_IPC_EVL
         , tims_(create_backend_config(config),
-                config.cross_process ? IpcMailbox::Mode::Public
-                                     : IpcMailbox::Mode::Local)
+                config.network       ? IpcMailbox::Mode::Network :
+                config.cross_process ? IpcMailbox::Mode::Public  :
+                                       IpcMailbox::Mode::Local,
+                create_network_config(config))
 #else
         , tims_(create_backend_config(config))
 #endif
@@ -291,6 +293,22 @@ private:
         for (int i = pos - 1; i >= 0; --i) tc.mailbox_name.push_back(digits[i]);
         return tc;
     }
+
+#ifdef CORERAT_IPC_EVL
+    static EvlNetworkConfig create_network_config(const MailboxConfig& config) noexcept {
+        EvlNetworkConfig nc{};
+        const uint8_t count = std::min(
+            config.network_peer_count,
+            static_cast<uint8_t>(EvlNetworkConfig::kMaxPeers));
+        nc.peer_count = count;
+        for (uint8_t i = 0; i < count; ++i) {
+            nc.peers[i].mailbox_id = config.network_peers[i].mailbox_id;
+            std::strncpy(nc.peers[i].ip, config.network_peers[i].ip,
+                         sizeof(nc.peers[i].ip) - 1);
+        }
+        return nc;
+    }
+#endif
 
     MailboxConfig       config_;
     IpcMailbox          tims_;

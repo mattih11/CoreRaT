@@ -41,6 +41,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #ifdef CORERAT_PLATFORM_EVL
 #include <evl/evl.h>
@@ -48,6 +50,7 @@
 #include <evl/event.h>
 #include <evl/clock.h>
 #include <evl/factory-abi.h>
+#include <evl/net.h>
 #endif
 
 namespace corerat {
@@ -101,12 +104,32 @@ struct ShmLayout {
 static_assert(sizeof(ShmLayout) == 16, "ShmLayout must be 16 bytes");
 
 // ============================================================================
+// EvlNetworkConfig — peer table for Mode::Network (OOB UDP, cross-machine)
+//
+// Port assignment is deterministic: kOobBasePort + mailbox_id.
+// Peers must be solicited before the first OOB send so EVL's route/ARP
+// front-caches are primed and no demotion to in-band occurs.
+// ============================================================================
+
+struct EvlNetworkConfig {
+    static constexpr uint16_t kOobBasePort = 42000;
+    static constexpr uint8_t  kMaxPeers    = 8;
+
+    struct Peer {
+        uint32_t mailbox_id{0};
+        char     ip[16]{};  ///< IPv4 dotted-decimal, e.g. "10.10.10.11"
+    };
+    std::array<Peer, kMaxPeers> peers{};
+    uint8_t peer_count{0};
+};
+
+// ============================================================================
 // EvlMailbox
 // ============================================================================
 
 class EvlMailbox {
 public:
-    enum class Mode { Local, Public };
+    enum class Mode { Local, Public, Network };
 
     /// Metadata compatible with TimsMailbox::Metadata
     struct Metadata {
@@ -118,8 +141,9 @@ public:
     };
 
     explicit EvlMailbox(const TimsConfig& config,
-                        Mode mode = Mode::Local)
-        : config_(config), mode_(mode) {}
+                        Mode mode = Mode::Local,
+                        const EvlNetworkConfig& net_config = {})
+        : config_(config), mode_(mode), net_config_(net_config) {}
 
     ~EvlMailbox() { shutdown(); }
 
@@ -134,6 +158,13 @@ public:
 
     TimsResult initialize() {
         if (created_) return TimsResult::SUCCESS;
+
+        // Network mode: OOB UDP socket, no ring buffer needed
+        if (mode_ == Mode::Network) {
+            if (!create_oob_socket()) return TimsResult::ERROR_INIT;
+            created_ = true;
+            return TimsResult::SUCCESS;
+        }
 
         constexpr uint32_t kSlots = 10;
         const auto slot_size = static_cast<uint32_t>(config_.max_msg_size);
@@ -150,6 +181,13 @@ public:
 
     void shutdown() {
         if (!created_) return;
+
+        // Network mode: just close the OOB socket
+        if (mode_ == Mode::Network) {
+            if (oob_sock_ >= 0) { ::close(oob_sock_); oob_sock_ = -1; }
+            created_ = false;
+            return;
+        }
 
         close_all_remotes();
 
@@ -407,6 +445,135 @@ private:
     }
 
     // ========================================================================
+    // OOB UDP socket — Mode::Network implementation
+    //
+    // Each mailbox binds to INADDR_ANY on port (kOobBasePort + mailbox_id).
+    // Senders look up the peer IP from net_config_ and use port
+    // (kOobBasePort + dest_id) as destination.  evl_net_solicit() is called
+    // once per peer at initialize() so EVL's ARP/route front caches are warm
+    // and every subsequent oob_sendmsg() stays on the out-of-band stage.
+    // ========================================================================
+
+    bool create_oob_socket() noexcept {
+#ifdef CORERAT_PLATFORM_EVL
+        evl_init();
+
+        oob_sock_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_OOB, 0);
+        if (oob_sock_ < 0) return false;
+
+        // Bind to INADDR_ANY : kOobBasePort + my mailbox_id
+        struct sockaddr_in local{};
+        local.sin_family      = AF_INET;
+        local.sin_port        = htons(static_cast<uint16_t>(
+                                    EvlNetworkConfig::kOobBasePort
+                                    + config_.mailbox_id));
+        local.sin_addr.s_addr = INADDR_ANY;
+        if (::bind(oob_sock_,
+                   reinterpret_cast<struct sockaddr*>(&local),
+                   sizeof(local)) < 0) {
+            ::close(oob_sock_); oob_sock_ = -1;
+            return false;
+        }
+
+        // Build peer table and prime EVL routing + ARP front caches
+        for (uint8_t i = 0; i < net_config_.peer_count; ++i) {
+            const auto& p = net_config_.peers[i];
+            struct sockaddr_in peer{};
+            peer.sin_family = AF_INET;
+            peer.sin_port   = htons(static_cast<uint16_t>(
+                                  EvlNetworkConfig::kOobBasePort
+                                  + p.mailbox_id));
+            if (::inet_pton(AF_INET, p.ip, &peer.sin_addr) <= 0) continue;
+
+            auto& entry      = net_peers_[i];
+            entry.mailbox_id = p.mailbox_id;
+            entry.addr       = peer;
+            entry.valid      = true;
+
+            // EVL_NEIGH_PERMANENT keeps ARP entry from ageing out;
+            // EVL_NEIGH_MAYROUTE allows the path to go through a gateway.
+            evl_net_solicit(oob_sock_,
+                            reinterpret_cast<const struct sockaddr*>(&peer),
+                            EVL_NEIGH_PERMANENT | EVL_NEIGH_MAYROUTE);
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    TimsResult send_oob_udp(const void* data, std::size_t size,
+                            uint32_t dest) noexcept {
+#ifdef CORERAT_PLATFORM_EVL
+        const NetworkPeerEntry* entry = nullptr;
+        for (const auto& e : net_peers_)
+            if (e.valid && e.mailbox_id == dest) { entry = &e; break; }
+        if (!entry) return TimsResult::ERROR_SEND;
+
+        struct iovec iov{};
+        iov.iov_base = const_cast<void*>(data);
+        iov.iov_len  = size;
+
+        struct oob_msghdr msghdr{};
+        msghdr.msg_name    = const_cast<struct sockaddr_in*>(&entry->addr);
+        msghdr.msg_namelen = sizeof(entry->addr);
+        msghdr.msg_iov     = &iov;
+        msghdr.msg_iovlen  = 1;
+
+        if (oob_sendmsg(oob_sock_, &msghdr, nullptr, 0) < 0)
+            return TimsResult::ERROR_SEND;
+        messages_sent_.fetch_add(1, std::memory_order_relaxed);
+        return TimsResult::SUCCESS;
+#else
+        (void)data; (void)size; (void)dest;
+        return TimsResult::ERROR_SEND;
+#endif
+    }
+
+    ssize_t receive_oob_udp(std::span<std::byte> buffer,
+                            Duration timeout, Metadata* meta) noexcept {
+#ifdef CORERAT_PLATFORM_EVL
+        struct iovec iov{};
+        iov.iov_base = buffer.data();
+        iov.iov_len  = buffer.size();
+
+        struct oob_msghdr msghdr{};
+        msghdr.msg_iov    = &iov;
+        msghdr.msg_iovlen = 1;
+
+        // oob_recvmsg timeout is a relative duration (not absolute deadline)
+        struct timespec ts{};
+        const struct timespec* ts_ptr = nullptr;
+        if (!timeout.is_negative()) {
+            const int64_t ns = timeout.count_ns();
+            ts.tv_sec  = static_cast<time_t>(ns / 1'000'000'000LL);
+            ts.tv_nsec = static_cast<long>(ns  % 1'000'000'000LL);
+            ts_ptr = &ts;
+        }
+
+        const ssize_t ret = oob_recvmsg(oob_sock_, &msghdr, ts_ptr, 0);
+        if (ret <= 0) return ret;
+
+        if (meta) {
+            WireHeader hdr{};
+            if (static_cast<std::size_t>(ret) >= sizeof(WireHeader))
+                std::memcpy(&hdr, buffer.data(), sizeof(WireHeader));
+            meta->src      = hdr.src;
+            meta->dest     = hdr.dest;
+            meta->seq_nr   = hdr.seq_number;
+            meta->priority = 0;
+            meta->flags    = static_cast<uint8_t>(hdr.flags);
+        }
+
+        messages_received_.fetch_add(1, std::memory_order_relaxed);
+        return ret;
+#else
+        (void)buffer; (void)timeout; (void)meta;
+        return -1;
+#endif
+    }
+
+    // ========================================================================
     // Remote handle — opened on demand for PUBLIC cross-process sends.
     //
     // Names are fully deterministic from dest_id, so no evl-router lookup is
@@ -551,6 +718,9 @@ private:
         if (!data || size == 0 || size > config_.max_msg_size)
             return TimsResult::ERROR_INVALID_MSG;
 
+        if (mode_ == Mode::Network)
+            return send_oob_udp(data, size, dest);
+
         bool ok = false;
 
         if (mode_ == Mode::Public) {
@@ -584,6 +754,9 @@ private:
     ssize_t receive_impl(std::span<std::byte> buffer,
                          Duration timeout, Metadata* meta) noexcept {
         if (!created_) return -1;
+
+        if (mode_ == Mode::Network)
+            return receive_oob_udp(buffer, timeout, meta);
 
 #ifdef CORERAT_PLATFORM_EVL
         evl_lock_mutex(&ring_mutex_);
@@ -674,6 +847,17 @@ private:
 
     // Remote handle cache for PUBLIC cross-process sends
     std::array<RemoteHandle, kMaxRemoteHandles> remote_handles_{};
+
+    // ── Network mode (Mode::Network) ─────────────────────────────────────────
+    EvlNetworkConfig net_config_{};
+    int              oob_sock_{-1};
+
+    struct NetworkPeerEntry {
+        uint32_t         mailbox_id{0};
+        struct sockaddr_in addr{};
+        bool             valid{false};
+    };
+    std::array<NetworkPeerEntry, EvlNetworkConfig::kMaxPeers> net_peers_{};
 };
 
 }  // namespace corerat

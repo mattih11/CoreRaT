@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <array>
 #include <optional>
 
 namespace corerat {
@@ -101,6 +102,20 @@ struct MailboxConfig {
     /// EVL only: use Mode::Public (cross-process SHM ring).
     /// On STD/TIMS this field is ignored — the TCP router handles routing.
     bool     cross_process    = false;
+
+    /// EVL only: use Mode::Network (OOB UDP over IPv4, cross-machine real-time).
+    /// Requires `evl net -ei <iface>` on the network device before use.
+    /// On STD/TIMS this field is ignored.
+    /// Port assignment: 42000 + mailbox_id (matches EvlNetworkConfig::kOobBasePort).
+    bool     network          = false;
+
+    struct NetworkPeer {
+        uint32_t mailbox_id{0};
+        char     ip[16]{};  ///< IPv4 dotted-decimal, e.g. "10.10.10.11"
+    };
+    static constexpr uint8_t kMaxNetworkPeers = 8;
+    std::array<NetworkPeer, kMaxNetworkPeers> network_peers{};
+    uint8_t  network_peer_count{0};
 };
 
 } // namespace corerat
