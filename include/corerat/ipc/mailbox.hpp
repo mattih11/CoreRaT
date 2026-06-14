@@ -297,14 +297,15 @@ private:
 #ifdef CORERAT_IPC_EVL
     static EvlNetworkConfig create_network_config(const MailboxConfig& config) noexcept {
         EvlNetworkConfig nc{};
+        nc.local_system_id = config.local_system_id;
         const uint8_t count = std::min(
-            config.network_peer_count,
-            static_cast<uint8_t>(EvlNetworkConfig::kMaxPeers));
-        nc.peer_count = count;
+            config.network_route_count,
+            static_cast<uint8_t>(EvlNetworkConfig::kMaxRoutes));
+        nc.route_count = count;
         for (uint8_t i = 0; i < count; ++i) {
-            nc.peers[i].mailbox_id = config.network_peers[i].mailbox_id;
-            std::strncpy(nc.peers[i].ip, config.network_peers[i].ip,
-                         sizeof(nc.peers[i].ip) - 1);
+            nc.routes[i].system_id = config.network_routes[i].system_id;
+            std::strncpy(nc.routes[i].ip, config.network_routes[i].ip,
+                         sizeof(nc.routes[i].ip) - 1);
         }
         return nc;
     }

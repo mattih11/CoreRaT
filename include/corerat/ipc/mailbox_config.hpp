@@ -106,16 +106,28 @@ struct MailboxConfig {
     /// EVL only: use Mode::Network (OOB UDP over IPv4, cross-machine real-time).
     /// Requires `evl net -ei <iface>` on the network device before use.
     /// On STD/TIMS this field is ignored.
-    /// Port assignment: 42000 + mailbox_id (matches EvlNetworkConfig::kOobBasePort).
+    ///
+    /// Routing is system_id based, matching RACK/TiMS:
+    ///   mailbox_id[31:24] = system_id  (identifies the host)
+    ///   mailbox_id[23:16] = class_id
+    ///   mailbox_id[15:8]  = instance_id
+    ///   mailbox_id[7:0]   = local_id
+    ///
+    /// Port assignment: kOobBasePort + (mailbox_id & 0x7FFF).
+    /// Peer lookup: extract (dest >> 24) & 0xFF, find matching NetworkRoute.system_id.
     bool     network          = false;
 
-    struct NetworkPeer {
-        uint32_t mailbox_id{0};
-        char     ip[16]{};  ///< IPv4 dotted-decimal, e.g. "10.10.10.11"
+    /// This host's system ID — must match the top byte of mailbox_id.
+    uint8_t  local_system_id  = 0;
+
+    /// Route table: system_id → IP address.  One entry per remote host.
+    struct NetworkRoute {
+        uint8_t system_id{0};
+        char    ip[16]{};  ///< IPv4 dotted-decimal, e.g. "10.10.10.11"
     };
-    static constexpr uint8_t kMaxNetworkPeers = 8;
-    std::array<NetworkPeer, kMaxNetworkPeers> network_peers{};
-    uint8_t  network_peer_count{0};
+    static constexpr uint8_t kMaxNetworkRoutes = 8;
+    std::array<NetworkRoute, kMaxNetworkRoutes> network_routes{};
+    uint8_t  network_route_count{0};
 };
 
 } // namespace corerat

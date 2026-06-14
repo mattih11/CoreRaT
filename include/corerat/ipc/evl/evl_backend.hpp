@@ -104,23 +104,45 @@ struct ShmLayout {
 static_assert(sizeof(ShmLayout) == 16, "ShmLayout must be 16 bytes");
 
 // ============================================================================
-// EvlNetworkConfig — peer table for Mode::Network (OOB UDP, cross-machine)
+// ============================================================================
+// EvlNetworkConfig — system-id-based route table for Mode::Network
 //
-// Port assignment is deterministic: kOobBasePort + mailbox_id.
-// Peers must be solicited before the first OOB send so EVL's route/ARP
-// front-caches are primed and no demotion to in-band occurs.
+// Routing follows the RACK/TiMS convention:
+//   mailbox_id[31:24] = system_id  (identifies the host)
+//   mailbox_id[23:0]  = class/instance/local fields
+//
+// Port assignment: kOobBasePort + (mailbox_id & 0x7FFF)
+//   → ports 42000–74767, safe range for registered/ephemeral split.
+//
+// On send:  extract dest_sys = (dest_mailbox_id >> 24) & 0xFF
+//           look up Route by system_id → get destination IP
+//           destination port = kOobBasePort + (dest_mailbox_id & 0x7FFF)
+//
+// evl_net_solicit() is called once per remote host at initialize() so
+// EVL's ARP/route front-caches are primed and every subsequent
+// oob_sendmsg() stays fully on the out-of-band stage.
 // ============================================================================
 
 struct EvlNetworkConfig {
-    static constexpr uint16_t kOobBasePort = 42000;
-    static constexpr uint8_t  kMaxPeers    = 8;
+    static constexpr uint16_t kOobBasePort  = 42000;
+    static constexpr uint8_t  kMaxRoutes    = 8;
 
-    struct Peer {
-        uint32_t mailbox_id{0};
-        char     ip[16]{};  ///< IPv4 dotted-decimal, e.g. "10.10.10.11"
+    /// Route table entry: one per remote host.
+    struct Route {
+        uint8_t system_id{0};
+        char    ip[16]{};  ///< IPv4 dotted-decimal, e.g. "10.10.10.11"
     };
-    std::array<Peer, kMaxPeers> peers{};
-    uint8_t peer_count{0};
+
+    uint8_t                         local_system_id{0};
+    std::array<Route, kMaxRoutes>   routes{};
+    uint8_t                         route_count{0};
+
+    static constexpr uint16_t port_for(uint32_t mailbox_id) noexcept {
+        return static_cast<uint16_t>(kOobBasePort + (mailbox_id & 0x7FFFu));
+    }
+    static constexpr uint8_t system_id_of(uint32_t mailbox_id) noexcept {
+        return static_cast<uint8_t>((mailbox_id >> 24) & 0xFFu);
+    }
 };
 
 // ============================================================================
@@ -447,11 +469,13 @@ private:
     // ========================================================================
     // OOB UDP socket — Mode::Network implementation
     //
-    // Each mailbox binds to INADDR_ANY on port (kOobBasePort + mailbox_id).
-    // Senders look up the peer IP from net_config_ and use port
-    // (kOobBasePort + dest_id) as destination.  evl_net_solicit() is called
-    // once per peer at initialize() so EVL's ARP/route front caches are warm
-    // and every subsequent oob_sendmsg() stays on the out-of-band stage.
+    // Bind port: kOobBasePort + (my mailbox_id & 0x7FFF)
+    // Send port: kOobBasePort + (dest_mailbox_id & 0x7FFF) at dest host's IP
+    // Route key: dest_system_id = (dest_mailbox_id >> 24) & 0xFF
+    //
+    // evl_net_solicit() is called once per remote host (not per mailbox) at
+    // initialize() time, priming EVL's ARP/route front-caches so every
+    // subsequent oob_sendmsg() stays fully on the out-of-band stage.
     // ========================================================================
 
     bool create_oob_socket() noexcept {
@@ -461,12 +485,10 @@ private:
         oob_sock_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_OOB, 0);
         if (oob_sock_ < 0) return false;
 
-        // Bind to INADDR_ANY : kOobBasePort + my mailbox_id
+        // Bind to INADDR_ANY : kOobBasePort + (mailbox_id & 0x7FFF)
         struct sockaddr_in local{};
         local.sin_family      = AF_INET;
-        local.sin_port        = htons(static_cast<uint16_t>(
-                                    EvlNetworkConfig::kOobBasePort
-                                    + config_.mailbox_id));
+        local.sin_port        = htons(EvlNetworkConfig::port_for(config_.mailbox_id));
         local.sin_addr.s_addr = INADDR_ANY;
         if (::bind(oob_sock_,
                    reinterpret_cast<struct sockaddr*>(&local),
@@ -475,23 +497,24 @@ private:
             return false;
         }
 
-        // Build peer table and prime EVL routing + ARP front caches
-        for (uint8_t i = 0; i < net_config_.peer_count; ++i) {
-            const auto& p = net_config_.peers[i];
+        // Build route table and prime EVL ARP/route front-caches once per host.
+        // Port used for solicitation is the base port; the actual per-mailbox
+        // port is resolved at send time from the dest mailbox_id.
+        const uint8_t count = std::min(net_config_.route_count,
+                                       EvlNetworkConfig::kMaxRoutes);
+        for (uint8_t i = 0; i < count; ++i) {
+            const auto& r = net_config_.routes[i];
             struct sockaddr_in peer{};
             peer.sin_family = AF_INET;
-            peer.sin_port   = htons(static_cast<uint16_t>(
-                                  EvlNetworkConfig::kOobBasePort
-                                  + p.mailbox_id));
-            if (::inet_pton(AF_INET, p.ip, &peer.sin_addr) <= 0) continue;
+            peer.sin_port   = htons(EvlNetworkConfig::kOobBasePort); // for solicitation
+            if (::inet_pton(AF_INET, r.ip, &peer.sin_addr) <= 0) continue;
 
-            auto& entry      = net_peers_[i];
-            entry.mailbox_id = p.mailbox_id;
-            entry.addr       = peer;
-            entry.valid      = true;
+            net_routes_[i].system_id = r.system_id;
+            net_routes_[i].ip_addr   = peer.sin_addr;
+            net_routes_[i].valid     = true;
 
-            // EVL_NEIGH_PERMANENT keeps ARP entry from ageing out;
-            // EVL_NEIGH_MAYROUTE allows the path to go through a gateway.
+            // EVL_NEIGH_PERMANENT — ARP entry never ages out.
+            // EVL_NEIGH_MAYROUTE  — allows path through a gateway (switch OK).
             evl_net_solicit(oob_sock_,
                             reinterpret_cast<const struct sockaddr*>(&peer),
                             EVL_NEIGH_PERMANENT | EVL_NEIGH_MAYROUTE);
@@ -505,18 +528,26 @@ private:
     TimsResult send_oob_udp(const void* data, std::size_t size,
                             uint32_t dest) noexcept {
 #ifdef CORERAT_PLATFORM_EVL
-        const NetworkPeerEntry* entry = nullptr;
-        for (const auto& e : net_peers_)
-            if (e.valid && e.mailbox_id == dest) { entry = &e; break; }
-        if (!entry) return TimsResult::ERROR_SEND;
+        const uint8_t dest_sys = EvlNetworkConfig::system_id_of(dest);
+
+        const NetworkRouteEntry* route = nullptr;
+        for (const auto& r : net_routes_)
+            if (r.valid && r.system_id == dest_sys) { route = &r; break; }
+        if (!route) return TimsResult::ERROR_SEND;
+
+        // Build destination address: route IP + mailbox-specific port
+        struct sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port   = htons(EvlNetworkConfig::port_for(dest));
+        dst.sin_addr   = route->ip_addr;
 
         struct iovec iov{};
         iov.iov_base = const_cast<void*>(data);
         iov.iov_len  = size;
 
         struct oob_msghdr msghdr{};
-        msghdr.msg_name    = const_cast<struct sockaddr_in*>(&entry->addr);
-        msghdr.msg_namelen = sizeof(entry->addr);
+        msghdr.msg_name    = &dst;
+        msghdr.msg_namelen = sizeof(dst);
         msghdr.msg_iov     = &iov;
         msghdr.msg_iovlen  = 1;
 
@@ -852,12 +883,13 @@ private:
     EvlNetworkConfig net_config_{};
     int              oob_sock_{-1};
 
-    struct NetworkPeerEntry {
-        uint32_t         mailbox_id{0};
-        struct sockaddr_in addr{};
+    /// One entry per remote host (not per mailbox).
+    struct NetworkRouteEntry {
+        uint8_t          system_id{0};
+        struct in_addr   ip_addr{};
         bool             valid{false};
     };
-    std::array<NetworkPeerEntry, EvlNetworkConfig::kMaxPeers> net_peers_{};
+    std::array<NetworkRouteEntry, EvlNetworkConfig::kMaxRoutes> net_routes_{};
 };
 
 }  // namespace corerat
