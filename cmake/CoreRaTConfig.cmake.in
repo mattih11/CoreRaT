@@ -5,6 +5,23 @@ include(CMakeFindDependencyMacro)
 find_dependency(SeRTial REQUIRED)
 find_dependency(Threads REQUIRED)
 
+# Recreate EVL::evl imported target for downstream consumers when CoreRaT was
+# built with the EVL platform backend. The target is not exported to
+# CoreRaTTargets.cmake because it wraps a plain library found at build time;
+# we must re-find it here so the CoreRaT::corerat link interface resolves.
+if("@CORERAT_PLATFORM@" STREQUAL "EVL")
+    if(NOT TARGET EVL::evl)
+        find_library(CORERAT_EVL_LIBRARY NAMES evl REQUIRED
+            DOC "libevl runtime library (Xenomai 4 / libevl)")
+        find_path(CORERAT_EVL_INCLUDE_DIR NAMES evl/thread.h REQUIRED
+            DOC "libevl include directory")
+        add_library(EVL::evl UNKNOWN IMPORTED)
+        set_target_properties(EVL::evl PROPERTIES
+            IMPORTED_LOCATION       "${CORERAT_EVL_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${CORERAT_EVL_INCLUDE_DIR}")
+    endif()
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/CoreRaTTargets.cmake")
 
 check_required_components(CoreRaT)
