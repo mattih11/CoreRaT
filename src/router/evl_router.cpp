@@ -234,12 +234,12 @@ private:
             case Opcode::Register: {
                 const bool ok = registry_.add(req.info);
                 if (ok) {
-                    std::printf("[EVL router] registered mailbox {:08x} "
-                                 "(shm={}, mutex={}, event={})",
-                                 req.info.mailbox_id,
-                                 req.info.shm_name,
-                                 req.info.mutex_name,
-                                 req.info.event_name)
+                    printf("[EVL router] registered mailbox %08x "
+                           "(shm=%s, mutex=%s, event=%s)\n",
+                           req.info.mailbox_id,
+                           req.info.shm_name,
+                           req.info.mutex_name,
+                           req.info.event_name);
                 }
                 reply(ok ? Opcode::ReplyOk : Opcode::ReplyErr, req.info);
                 break;
@@ -257,8 +257,8 @@ private:
 
             case Opcode::Unregister:
                 registry_.remove(req.info.mailbox_id);
-                std::printf("[EVL router] unregistered mailbox {:08x}",
-                             req.info.mailbox_id)
+                printf("[EVL router] unregistered mailbox %08x\n",
+                       req.info.mailbox_id);
                 reply(Opcode::ReplyOk, req.info);
                 break;
 
@@ -290,14 +290,14 @@ public:
     bool is_ready() const noexcept { return server_.is_open(); }
 
     void run(std::stop_token stop) {
-        std::printf("[EVL router] listening on {}", kDefaultSocket)
+        printf("[EVL router] listening on %s\n", kDefaultSocket.data());
 
         while (!stop.stop_requested()) {
             auto sock = server_.accept();
             if (!sock) break;
 
             const int idx = next_index_++;
-            std::printf("[EVL router] new client[{}]", idx)
+            printf("[EVL router] new client[%d]\n", idx);
 
             auto handler = std::make_unique<ClientHandler>(
                 std::move(*sock), registry_, idx);
@@ -311,7 +311,7 @@ public:
             clients_.emplace_back(std::move(handler), std::move(thread));
         }
 
-        std::printf("[EVL router] shutting down")
+        printf("[EVL router] shutting down\n");
     }
 
 private:
@@ -345,14 +345,14 @@ int main(int argc, char* argv[]) {
         if ((arg == "--socket" || arg == "-s") && i + 1 < argc)
             socket_path = argv[++i];
         else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: corerat-router-evl [--socket PATH]")
+            printf("Usage: corerat-router-evl [--socket PATH]\n");
             return 0;
         }
     }
 
     corerat::evl_router::EvlRouter router{socket_path};
     if (!router.is_ready()) {
-        std::fprintf(stderr, "Failed to bind socket {}", socket_path)
+        fprintf(stderr, "Failed to bind socket %s\n", socket_path.c_str());
         return 1;
     }
 
