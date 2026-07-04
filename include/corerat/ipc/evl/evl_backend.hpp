@@ -50,7 +50,7 @@
 #include <evl/event.h>
 #include <evl/clock.h>
 #include <evl/factory-abi.h>
-#include <evl/net.h>
+#include <evl/net/net.h>
 #endif
 
 namespace corerat {
