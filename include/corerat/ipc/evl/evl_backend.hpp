@@ -876,9 +876,6 @@ private:
     uint32_t capacity_{0};
     uint32_t slot_size_{0};
 
-    // Remote handle cache for PUBLIC cross-process sends
-    std::array<RemoteHandle, kMaxRemoteHandles> remote_handles_{};
-
     // ── Network mode (Mode::Network) ─────────────────────────────────────────
     EvlNetworkConfig net_config_{};
     int              oob_sock_{-1};
