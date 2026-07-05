@@ -569,7 +569,11 @@ done < <(find /root/corerat/test -maxdepth 1 \
 echo "=== Integration tests ==="
 /root/corerat/corerat-router-tcp --port 2000 &
 ROUTER_PID=$!
-trap "kill $ROUTER_PID 2>/dev/null || true; wait $ROUTER_PID 2>/dev/null || true" EXIT
+# EVL name-service router (needed for PUBLIC EvlMailbox REGISTER/LOOKUP)
+mkdir -p /var/run/corerat
+/root/corerat/corerat-router-evl &
+EVL_ROUTER_PID=$!
+trap "kill $ROUTER_PID 2>/dev/null || true; wait $ROUTER_PID 2>/dev/null || true; kill $EVL_ROUTER_PID 2>/dev/null || true; wait $EVL_ROUTER_PID 2>/dev/null || true" EXIT
 sleep 0.3
 
 # Router smoke test
