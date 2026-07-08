@@ -507,10 +507,15 @@ done
 # Execute requested actions: cross-deploy -> build -> test -> run -> shell
 # ---------------------------------------------------------------------------
 
-# Deploy cross-compiled binaries to guest.
-if [[ -z "$DO_CROSS" && "$DO_SHELL" -eq 1 && -d "build/evl-cross" ]]; then
-    echo "Note: --shell without --cross; auto-deploying existing build/evl-cross/ to guest."
-    DO_CROSS="evl-cross"
+# Auto-detect cached build for --test / --shell when no explicit build requested.
+if [[ -z "$DO_CROSS" && -z "$DO_BUILD" && ( "$DO_SHELL" -eq 1 || "$DO_TEST" -eq 1 ) ]]; then
+    for _preset in evl evl-cross; do
+        if [[ -d "build/${_preset}/test" ]]; then
+            echo "Note: Using cached build/${_preset}/ (no --build/--cross specified)."
+            DO_CROSS="${_preset}"
+            break
+        fi
+    done
 fi
 if [[ -n "$DO_CROSS" ]]; then
     echo "Deploying build/${DO_CROSS}/ to guest /root/corerat/..."
@@ -540,87 +545,49 @@ if [[ -n "$DO_BUILD" ]]; then
         cmake --build --preset ${DO_BUILD} --parallel \$(nproc) 2>&1
         echo 'Build complete.'
     "
+    # Cache built binaries back to host so subsequent --test runs skip recompilation.
+    echo "Caching build/${DO_BUILD}/ from guest to host..."
+    mkdir -p "build/${DO_BUILD}"
+    rsync -az \
+        -e "ssh ${SSH_OPTS}" \
+        "root@127.0.0.1:/root/CoreRaT/build/${DO_BUILD}/" "build/${DO_BUILD}/"
+    # Treat as binary cache for --test/--shell/--run steps below.
+    DO_CROSS="${DO_BUILD}"
 fi
 
-# Run tests
+# Run tests — CMakeLists.txt is the single source of truth for all tests.
 if [[ "$DO_TEST" -eq 1 ]]; then
-    if [[ -n "$DO_CROSS" ]]; then
-        # Binaries cross-compiled and deployed to /root/corerat/
-        echo "Running CoreRaT tests on EVL guest..."
-        ssh ${SSH_OPTS} root@127.0.0.1 bash -c 'set -euo pipefail
-ulimit -H -t unlimited 2>/dev/null || true; ulimit -t unlimited 2>/dev/null || true
+    CTEST_PRESET="${DO_BUILD:-evl}"
 
-ok=0; fail=0
-
-# ---- Unit tests (no router needed) ----
-echo "=== Unit tests ==="
-while IFS= read -r -d "" t; do
-    printf "  %-50s" "$(basename "$t")"
-    if timeout 30 "$t" > /tmp/.test_out 2>&1; then
-        echo PASS; ((ok++)) || true
-    else
-        echo FAIL; ((fail++)) || true; cat /tmp/.test_out
-    fi
-done < <(find /root/corerat/test -maxdepth 1 \
-              -name "test_*" -not -name "test_router_tcp" \
-              -executable -type f -print0 | sort -z)
-
-# ---- Integration tests (router required) ----
-echo "=== Integration tests ==="
-/root/corerat/corerat-router-tcp --port 2000 &
-ROUTER_PID=$!
-# EVL name-service router (needed for PUBLIC EvlMailbox REGISTER/LOOKUP)
-mkdir -p /var/run/corerat
-/root/corerat/corerat-router-evl &
-EVL_ROUTER_PID=$!
-trap "kill $ROUTER_PID 2>/dev/null || true; wait $ROUTER_PID 2>/dev/null || true; kill $EVL_ROUTER_PID 2>/dev/null || true; wait $EVL_ROUTER_PID 2>/dev/null || true" EXIT
-sleep 0.3
-
-# Router smoke test
-printf "  %-50s" "test_router_tcp"
-if timeout 10 /root/corerat/test/test_router_tcp > /tmp/.test_out 2>&1; then
-    echo PASS; ((ok++)) || true
-else
-    echo FAIL; ((fail++)) || true; cat /tmp/.test_out
-fi
-
-# Ping-pong test (cross-process, no router needed on EVL)
-printf "  %-50s" "test_pingpong"
-/root/corerat/test/pong_node --count 100 > /tmp/.pong_out 2>&1 &
-PONG_PID=$!
-sleep 0.3
-if timeout 20 /root/corerat/test/ping_node --count 100 > /tmp/.test_out 2>&1; then
-    echo PASS; ((ok++)) || true
-else
-    echo FAIL; ((fail++)) || true
-    echo "  ping_node output:"; cat /tmp/.test_out
-    echo "  pong_node output:"; cat /tmp/.pong_out
-fi
-kill "$PONG_PID" 2>/dev/null || true
-wait "$PONG_PID" 2>/dev/null || true
-
-# EVL single-binary LOCAL mode latency benchmark
-if [[ -x /root/corerat/test/evl_pingpong ]]; then
-    printf "  %-50s" "test_evl_pingpong"
-    if timeout 20 /root/corerat/test/evl_pingpong --count 100 > /tmp/.test_out 2>&1; then
-        echo PASS; ((ok++)) || true
-    else
-        echo FAIL; ((fail++)) || true; cat /tmp/.test_out
-    fi
-fi
-
-echo ""
-echo "Results: ${ok} passed, ${fail} failed"
-[[ $fail -eq 0 ]]'
-    else
-        CTEST_PRESET="${DO_BUILD:-default}"
-        echo "Running ctest (preset: ${CTEST_PRESET}) on EVL guest..."
+    if [[ -z "$DO_BUILD" && -n "$DO_CROSS" ]]; then
+        # Binary cache: deploy source + binaries into CMake build tree,
+        # reconfigure (fast, ~0.5s — no build, just generates CTestTestfile.cmake
+        # with guest-local paths), then ctest.
+        echo "Deploying source + build/${DO_CROSS}/ to guest for ctest..."
+        rsync -az --delete \
+            --exclude=build --exclude=.git --exclude=CommRaT \
+            --exclude=tims --exclude=.evl-cache \
+            -e "ssh ${SSH_OPTS}" \
+            ./ "root@127.0.0.1:/root/CoreRaT/"
+        ssh ${SSH_OPTS} root@127.0.0.1 mkdir -p "/root/CoreRaT/build/evl"
+        rsync -az \
+            -e "ssh ${SSH_OPTS}" \
+            "build/${DO_CROSS}/" "root@127.0.0.1:/root/CoreRaT/build/evl/"
+        echo "Configuring on guest (generates CTestTestfile.cmake)..."
         ssh ${SSH_OPTS} root@127.0.0.1 bash -lc "
             set -euo pipefail
             cd /root/CoreRaT
-            ctest --preset ${CTEST_PRESET} --output-on-failure 2>&1
+            rm -f build/evl/CMakeCache.txt
+            cmake --preset evl 2>&1
         "
     fi
+
+    echo "Running ctest --preset ${CTEST_PRESET} on EVL guest..."
+    ssh ${SSH_OPTS} root@127.0.0.1 bash -lc "
+        set -euo pipefail
+        cd /root/CoreRaT
+        ctest --preset ${CTEST_PRESET} --timeout 120 --output-on-failure 2>&1
+    "
 fi
 
 # Run specific binaries
@@ -637,15 +604,12 @@ if [[ "$DO_SHELL" -eq 1 ]]; then
     echo ""
     echo "Opening interactive EVL guest shell."
     if [[ -n "$DO_CROSS" ]]; then
-        echo "Cross-compiled binaries are at /root/corerat/"
-        echo "  Router:    /root/corerat/corerat-router-tcp"
+        echo "Binaries are at /root/corerat/"
+        echo "  Router:    /usr/bin/corerat-router-tcp (systemd service)"
         echo "  ping_node: /root/corerat/test/ping_node"
         echo "  pong_node: /root/corerat/test/pong_node"
         echo "  evl ps     — check EVL thread status"
         echo "  evl check  — verify RT health"
-    elif [[ -n "$DO_BUILD" ]]; then
-        echo "CoreRaT source + build are at /root/CoreRaT/"
-        echo "Build output at /root/CoreRaT/build/${DO_BUILD}/"
     fi
     echo "Type 'exit' to stop QEMU and clean up."
     echo ""
