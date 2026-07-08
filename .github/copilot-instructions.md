@@ -395,3 +395,33 @@ No emojis anywhere — not in source, headers, docs, or cout output.
 4. `CORERAT_PLATFORM_STD` must build and test on any Linux host without libevl
 5. All public APIs validated at compile time — no runtime type dispatch
 6. `CoreRaTConfig.cmake` must export `EVL::evl` imported target for downstream consumers when built with `CORERAT_PLATFORM=EVL`
+
+## Future Considerations
+
+### Shared evl-dev.sh (post-Phase-3)
+
+Currently both CoreRaT and CommRaT maintain their own copy of `scripts/evl-dev.sh`.
+The two copies share ~95% of their logic; differences are:
+
+| Aspect | CoreRaT | CommRaT |
+|---|---|---|
+| Env file | `.corerat.env` | `.commrat.env` |
+| Guest source path | `/root/CoreRaT/` | `/root/CommRaT/` |
+| Work dir prefix | `/tmp/corerat-evl-*` | `/tmp/commrat-evl-*` |
+| rsync excludes | `CommRaT`, `tims` | none extra |
+
+When CoreRaT is installed as a proper system package (post-Phase-3), the script
+should move to CoreRaT and accept project-level configuration so downstream projects
+(CommRaT, etc.) invoke it without carrying their own copy:
+
+```bash
+# Downstream project invocation (future):
+corerat-evl-dev \
+    --project-name CommRaT \
+    --env-file .commrat.env \
+    --guest-dir /root/CommRaT \
+    "$@"
+```
+
+Until then: sync improvements manually between the two copies. Changes that belong
+in both scripts should be applied to CoreRaT first, then ported to CommRaT.

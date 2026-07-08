@@ -86,6 +86,18 @@ inline std::string_view shm_name(char (&buf)[64], uint32_t id) noexcept {
     return evl_name(buf, "/corerat_mbx_", id);
 }
 
+#ifdef CORERAT_PLATFORM_EVL
+/// Attach the calling thread to the EVL scheduler if not already attached.
+/// Must be called before any OOB syscall (evl_lock_mutex, evl_wait_event …).
+/// -EBUSY = already attached on this thread, which is fine.
+inline void attach_this_thread() noexcept {
+    const int r = evl_attach_thread(EVL_CLONE_PRIVATE,
+                                    "corerat.%d",
+                                    static_cast<int>(gettid()));
+    (void)(r == 0 || r == -EBUSY);  // any other error is non-fatal here
+}
+#endif
+
 }  // namespace evl_detail
 
 // ============================================================================
@@ -360,7 +372,12 @@ private:
 
     bool create_evl_objects() noexcept {
 #ifdef CORERAT_PLATFORM_EVL
+        // Use raw write() for all diagnostics here: printf/fprintf use the
+        // libc buffer which is lost on SIGKILL.  write() is atomic + unbuffered.
+#define _EVL_LOG(msg) do { ::write(STDERR_FILENO, msg, sizeof(msg) - 1); } while(0)
+
         evl_init();
+        evl_detail::attach_this_thread();
         const int flags  = (mode_ == Mode::Public)
                          ? (EVL_MUTEX_NORMAL | EVL_CLONE_PUBLIC)
                          : (EVL_MUTEX_NORMAL | EVL_CLONE_PRIVATE);
@@ -370,16 +387,32 @@ private:
 
         char name_buf[64];
         evl_detail::evl_name(name_buf, "corerat-ring-mtx-", config_.mailbox_id);
-        if (evl_create_mutex(&ring_mutex_, EVL_CLOCK_MONOTONIC,
-                             0, flags, "%s", name_buf) < 0)
+        _EVL_LOG("[corerat] evl_create_mutex...\n");
+        const int mr = evl_create_mutex(&ring_mutex_, EVL_CLOCK_MONOTONIC,
+                                        0, flags, "%s", name_buf);
+        if (mr < 0) {
+            char ebuf[64];
+            const int n = std::snprintf(ebuf, sizeof(ebuf),
+                "[corerat] evl_create_mutex failed: %d\n", mr);
+            ::write(STDERR_FILENO, ebuf, static_cast<std::size_t>(n));
             return false;
+        }
+        _EVL_LOG("[corerat] evl_create_mutex OK\n");
 
         evl_detail::evl_name(name_buf, "corerat-ring-evt-", config_.mailbox_id);
-        if (evl_create_event(&ring_event_, EVL_CLOCK_MONOTONIC,
-                             eflags, "%s", name_buf) < 0) {
+        _EVL_LOG("[corerat] evl_create_event...\n");
+        const int er = evl_create_event(&ring_event_, EVL_CLOCK_MONOTONIC,
+                                        eflags, "%s", name_buf);
+        if (er < 0) {
+            char ebuf[64];
+            const int n = std::snprintf(ebuf, sizeof(ebuf),
+                "[corerat] evl_create_event failed: %d\n", er);
+            ::write(STDERR_FILENO, ebuf, static_cast<std::size_t>(n));
             evl_close_mutex(&ring_mutex_);
             return false;
         }
+        _EVL_LOG("[corerat] evl_create_event OK\n");
+#undef _EVL_LOG
 #endif
         return true;
     }
@@ -445,6 +478,7 @@ private:
     bool post(const void* data, std::size_t size,
               int8_t priority, uint32_t src) noexcept {
 #ifdef CORERAT_PLATFORM_EVL
+        evl_detail::attach_this_thread();
         evl_lock_mutex(&ring_mutex_);
 #endif
         int idx = find_free_slot();
@@ -460,8 +494,10 @@ private:
         slot_meta_at(idx) = SlotMeta{ priority, true, src, static_cast<uint32_t>(size) };
 
 #ifdef CORERAT_PLATFORM_EVL
-        evl_unlock_mutex(&ring_mutex_);
+        // Signal before unlock: keeps the calling thread in OOB context so the
+        // signal reaches any OOB-blocked waiter via the fast in-band→OOB path.
         evl_signal_event(&ring_event_);
+        evl_unlock_mutex(&ring_mutex_);
 #endif
         return true;
     }
@@ -641,6 +677,9 @@ private:
     }
 
     bool open_remote(RemoteHandle& h, uint32_t dest) noexcept {
+#ifdef CORERAT_PLATFORM_EVL
+        evl_detail::attach_this_thread();
+#endif
         char name_buf[64];
         evl_detail::shm_name(name_buf, dest);
 
@@ -693,6 +732,9 @@ private:
     /// Post directly into a remote process's ring buffer via its mapped SHM.
     bool post_to_remote(RemoteHandle& h, const void* data,
                         std::size_t size, int8_t priority) noexcept {
+#ifdef CORERAT_PLATFORM_EVL
+        evl_detail::attach_this_thread();
+#endif
         auto* layout  = static_cast<ShmLayout*>(h.shm_base);
         auto* meta    = reinterpret_cast<SlotMeta*>(
                             static_cast<uint8_t*>(h.shm_base) + sizeof(ShmLayout));
@@ -734,8 +776,8 @@ private:
                               static_cast<uint32_t>(sz) };
 
 #ifdef CORERAT_PLATFORM_EVL
-        evl_unlock_mutex(&h.mutex);
         evl_signal_event(&h.event);
+        evl_unlock_mutex(&h.mutex);
 #endif
         return true;
     }
@@ -790,11 +832,18 @@ private:
             return receive_oob_udp(buffer, timeout, meta);
 
 #ifdef CORERAT_PLATFORM_EVL
+        evl_detail::attach_this_thread();
         evl_lock_mutex(&ring_mutex_);
 
+        // Standard condvar pattern: loop to guard against spurious wakeups.
         if (!has_in_use_slot()) {
             if (timeout.is_negative()) {
-                evl_wait_event(&ring_event_, &ring_mutex_);
+                while (!has_in_use_slot()) {
+                    if (evl_wait_event(&ring_event_, &ring_mutex_) < 0) {
+                        evl_unlock_mutex(&ring_mutex_);
+                        return -1;
+                    }
+                }
             } else {
                 struct timespec now{};
                 evl_read_clock(EVL_CLOCK_MONOTONIC, &now);
@@ -806,16 +855,18 @@ private:
                     static_cast<time_t>(deadline / 1'000'000'000LL),
                     static_cast<long>(deadline   % 1'000'000'000LL)
                 };
-
-                if (evl_timedwait_event(&ring_event_, &ring_mutex_, &abs_ts)
-                        == -ETIMEDOUT) {
-                    evl_unlock_mutex(&ring_mutex_);
-                    return -ETIMEDOUT;
+                while (!has_in_use_slot()) {
+                    const int r = evl_timedwait_event(
+                        &ring_event_, &ring_mutex_, &abs_ts);
+                    if (r == -ETIMEDOUT) {
+                        evl_unlock_mutex(&ring_mutex_);
+                        return -ETIMEDOUT;
+                    }
+                    if (r < 0) {
+                        evl_unlock_mutex(&ring_mutex_);
+                        return r;
+                    }
                 }
-            }
-            if (!has_in_use_slot()) {
-                evl_unlock_mutex(&ring_mutex_);
-                return -1;
             }
         }
 
