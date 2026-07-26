@@ -177,3 +177,25 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/CoreRaTConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CoreRaT
 )
+
+# ============================================================================
+# CPack — produces corerat-std_<version>_amd64.deb for STD-platform CI
+# Only active when CORERAT_PLATFORM=STD (the default preset).
+# ============================================================================
+
+if(CORERAT_PLATFORM STREQUAL "STD")
+    set(CPACK_PACKAGE_NAME            "corerat-std")
+    set(CPACK_PACKAGE_VERSION         "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+        "CoreRaT runtime — STD platform (TiMS IPC)")
+    set(CPACK_PACKAGE_CONTACT         "CoreRaT maintainers")
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
+    # Runtime deps: libstdc++/libc are always present on ubuntu-latest.
+    # SeRTial and reflectcpp are header-only and install into /usr/local —
+    # no Debian package dependency can express that, so we leave it empty.
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS  "")
+    set(CPACK_GENERATOR               "DEB")
+    set(CPACK_PACKAGE_FILE_NAME
+        "${CPACK_PACKAGE_NAME}_${CPACK_PACKAGE_VERSION}_amd64")
+    include(CPack)
+endif()

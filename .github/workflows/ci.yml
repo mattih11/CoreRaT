@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags:     ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ============================================================================
+  # STD platform — bare ubuntu-latest, no container
+  # ============================================================================
+  build-std:
+    name: Build & Test (STD platform)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config
+
+      - name: Install reflectcpp
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/pkgs
+          gh release download --repo getml/reflect-cpp \
+            --pattern "reflectcpp_*_amd64.deb" --dir /tmp/pkgs
+          sudo dpkg -i /tmp/pkgs/reflectcpp_*_amd64.deb
+
+      - name: Install SeRTial
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo mattih11/SeRTial \
+            --pattern "sertial_*_amd64.deb" --dir /tmp/pkgs
+          sudo dpkg -i /tmp/pkgs/sertial_*_amd64.deb
+
+      - name: Configure
+        run: cmake --preset default
+
+      - name: Build
+        run: cmake --build --preset default --parallel $(nproc)
+
+      - name: Test
+        run: |
+          ./build/default/corerat-router-tcp > /dev/null 2>&1 &
+          ROUTER_PID=$!
+          sleep 1
+          ctest --preset default --output-on-failure
+          STATUS=$?
+          kill $ROUTER_PID 2>/dev/null || true
+          exit $STATUS
+
+  # ============================================================================
+  # EVL platform — RaTOS QEMU (unaffected by the STD package chain)
+  # ============================================================================
+  build-evl:
+    name: Build & Test (EVL platform)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 rsync openssh-client e2fsprogs
+
+      - name: Run EVL tests in RaTOS QEMU
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/evl-dev.sh --cross evl-cross --test
+
+  # ============================================================================
+  # Publish corerat-std_<version>_amd64.deb on release tags
+  # ============================================================================
+  publish-deb:
+    name: Publish STD package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-std, build-evl]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config
+
+      - name: Install reflectcpp
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/pkgs
+          gh release download --repo getml/reflect-cpp \
+            --pattern "reflectcpp_*_amd64.deb" --dir /tmp/pkgs
+          sudo dpkg -i /tmp/pkgs/reflectcpp_*_amd64.deb
+
+      - name: Install SeRTial
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo mattih11/SeRTial \
+            --pattern "sertial_*_amd64.deb" --dir /tmp/pkgs
+          sudo dpkg -i /tmp/pkgs/sertial_*_amd64.deb
+
+      - name: Build and package
+        run: |
+          cmake --preset default -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build --preset default --parallel $(nproc)
+          cd build/default && cpack -G DEB
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            build/default/corerat-std_*_amd64.deb --clobber

@@ -14,7 +14,11 @@
       "name": "default",
       "displayName": "Default (STD platform, TiMS IPC, Release)",
       "description": "Standard Linux platform with RACK/TiMS IPC. Use inside the dev container or when all dependencies are installed locally.",
-      "inherits": "base"
+      "inherits": "base",
+      "cacheVariables": {
+        "CORERAT_PLATFORM": "STD",
+        "CORERAT_IPC": "TIMS"
+      }
     },
     {
       "name": "debug",
