@@ -29,7 +29,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/pkgs
-          gh release download --repo getml/reflect-cpp \
+          gh release download --repo mattih11/reflect-cpp \
             --pattern "reflectcpp_*_amd64.deb" --dir /tmp/pkgs
           sudo dpkg -i /tmp/pkgs/reflectcpp_*_amd64.deb
 
@@ -102,7 +102,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/pkgs
-          gh release download --repo getml/reflect-cpp \
+          gh release download --repo mattih11/reflect-cpp \
             --pattern "reflectcpp_*_amd64.deb" --dir /tmp/pkgs
           sudo dpkg -i /tmp/pkgs/reflectcpp_*_amd64.deb
 
