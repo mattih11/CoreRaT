@@ -31,8 +31,8 @@ jobs:
           mkdir -p /tmp/pkgs
           tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
           gh release download "${tag}" --repo mattih11/RaTOS \
-            --pattern "reflectcpp_*_amd64.deb" --dir /tmp/pkgs
-          sudo dpkg -i /tmp/pkgs/reflectcpp_*_amd64.deb
+            --pattern "libreflect-cpp-dev_*.deb" --dir /tmp/pkgs
+          sudo dpkg -i /tmp/pkgs/libreflect-cpp-dev_*.deb
 
       - name: Install SeRTial
         env:
@@ -105,8 +105,8 @@ jobs:
           mkdir -p /tmp/pkgs
           tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
           gh release download "${tag}" --repo mattih11/RaTOS \
-            --pattern "reflectcpp_*_amd64.deb" --dir /tmp/pkgs
-          sudo dpkg -i /tmp/pkgs/reflectcpp_*_amd64.deb
+            --pattern "libreflect-cpp-dev_*.deb" --dir /tmp/pkgs
+          sudo dpkg -i /tmp/pkgs/libreflect-cpp-dev_*.deb
 
       - name: Install SeRTial
         env:
