@@ -306,7 +306,7 @@ _do_download() {
             --repo "$RATOS_RELEASE_REPO" \
             --pattern "vmlinuz" \
             --pattern "initrd.img" \
-            --pattern "*container-amd64*.ext4.gz" \
+            --pattern "ratos-evl-image-container-amd64*.ext4.gz" \
             --dir "$dl_dir"
     fi
 
@@ -506,6 +506,14 @@ done
 # ---------------------------------------------------------------------------
 # Execute requested actions: cross-deploy -> build -> test -> run -> shell
 # ---------------------------------------------------------------------------
+
+# ratos-evl-image (layer 0) is minimal — install rsync if not present.
+# This takes ~2s when already installed (apt cache hit), ~10s on first boot.
+if [[ -n "$DO_CROSS" || -n "$DO_BUILD" ]]; then
+    ssh ${SSH_OPTS} root@127.0.0.1 \
+        'command -v rsync >/dev/null || (apt-get update -qq && apt-get install -y --no-install-recommends rsync)' \
+        2>/dev/null || true
+fi
 
 # Auto-detect cached build for --test / --shell when no explicit build requested.
 if [[ -z "$DO_CROSS" && -z "$DO_BUILD" && ( "$DO_SHELL" -eq 1 || "$DO_TEST" -eq 1 ) ]]; then
