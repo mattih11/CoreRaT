@@ -6,17 +6,23 @@ on:
     tags:     ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# Required GitHub Actions secrets (repo Settings -> Secrets -> Actions):
+#   RATOS_RELEASE_TOKEN  PAT with actions:read scope on mattih11/RaTOS
+#                        (needed to download SDK and QEMU artifacts)
 
 jobs:
-  # ============================================================================
-  # STD platform — bare ubuntu-latest, no container
-  # ============================================================================
+  # ---------------------------------------------------------------------------
+  # Job 1: Build and test on the standard Linux platform.
+  #        Runs on bare ubuntu-latest; deps installed from release .deb packages.
+  # ---------------------------------------------------------------------------
   build-std:
     name: Build & Test (STD platform)
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install build tools
         run: |
@@ -24,13 +30,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build pkg-config
 
+      - name: Read release tag
+        run: |
+          tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
+          echo "RATOS_RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
+
       - name: Install reflectcpp
         env:
           GH_TOKEN: ${{ secrets.RATOS_RELEASE_TOKEN }}
         run: |
           mkdir -p /tmp/pkgs
-          tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
-          gh release download "${tag}" --repo mattih11/RaTOS \
+          gh release download "${{ env.RATOS_RELEASE_TAG }}" --repo mattih11/RaTOS \
             --pattern "libreflect-cpp-dev_*.deb" --dir /tmp/pkgs
           sudo dpkg -i /tmp/pkgs/libreflect-cpp-dev_*.deb
 
@@ -58,39 +68,98 @@ jobs:
           kill $ROUTER_PID 2>/dev/null || true
           exit $STATUS
 
-  # ============================================================================
-  # EVL platform — RaTOS QEMU (unaffected by the STD package chain)
-  # ============================================================================
-  build-evl:
-    name: Build & Test (EVL platform)
+  # ---------------------------------------------------------------------------
+  # Job 2: Cross-compile with the EVL platform backend against the RaTOS SDK.
+  #        Compile-only check — no QEMU overhead.
+  # ---------------------------------------------------------------------------
+  build-evl-compile:
+    name: Build (EVL cross-compile)
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read release tag
+        run: |
+          tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
+          echo "RATOS_RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
+
+      - name: Install patchelf
+        run: sudo apt-get install -y --no-install-recommends patchelf
+
+      - name: Restore SDK cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .evl-cache/sdk
+            .evl-cache/.sdk_cache_key
+          key: ratos-sdk-${{ env.RATOS_RELEASE_TAG }}
+
+      - name: Cross-compile (EVL)
+        env:
+          RATOS_RELEASE_TOKEN: ${{ secrets.RATOS_RELEASE_TOKEN }}
+        run: scripts/evl-dev.sh --cross evl-cross
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Runtime tests inside a real EVL kernel via QEMU.
+  #        Depends on build-std passing first (catches obvious failures fast).
+  # ---------------------------------------------------------------------------
+  test-evl-runtime:
+    name: Runtime tests (EVL kernel via QEMU)
+    runs-on: ubuntu-latest
+    needs: build-std
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read release tag
+        run: |
+          tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
+          echo "RATOS_RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
 
       - name: Install QEMU and tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 rsync openssh-client e2fsprogs
+            qemu-system-x86 rsync openssh-client e2fsprogs patchelf
 
-      - name: Run EVL tests in RaTOS QEMU
+      - name: Restore SDK cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .evl-cache/sdk
+            .evl-cache/.sdk_cache_key
+          key: ratos-sdk-${{ env.RATOS_RELEASE_TAG }}
+
+      - name: Restore QEMU artifacts cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .evl-cache/ratos.ext4
+            .evl-cache/vmlinuz
+            .evl-cache/initrd.img
+            .evl-cache/.cache_key
+          key: ratos-qemu-${{ env.RATOS_RELEASE_TAG }}
+
+      - name: Cross-compile and run tests in QEMU
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          scripts/evl-dev.sh --cross evl-cross --test
+          RATOS_RELEASE_TOKEN: ${{ secrets.RATOS_RELEASE_TOKEN }}
+        run: scripts/evl-dev.sh --cross evl-cross --test
 
-  # ============================================================================
-  # Publish corerat-std_<version>_amd64.deb on release tags
-  # ============================================================================
+  # ---------------------------------------------------------------------------
+  # Job 4: Build and publish corerat-std_<version>_amd64.deb as a release asset.
+  #        Only runs on version tags (v*).
+  # ---------------------------------------------------------------------------
   publish-deb:
-    name: Publish STD package
+    name: Publish STD package (.deb)
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-std, build-evl]
-
+    needs: build-std
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install build tools
         run: |
@@ -98,13 +167,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build pkg-config
 
+      - name: Read release tag
+        run: |
+          tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
+          echo "RATOS_RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
+
       - name: Install reflectcpp
         env:
           GH_TOKEN: ${{ secrets.RATOS_RELEASE_TOKEN }}
         run: |
           mkdir -p /tmp/pkgs
-          tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
-          gh release download "${tag}" --repo mattih11/RaTOS \
+          gh release download "${{ env.RATOS_RELEASE_TAG }}" --repo mattih11/RaTOS \
             --pattern "libreflect-cpp-dev_*.deb" --dir /tmp/pkgs
           sudo dpkg -i /tmp/pkgs/libreflect-cpp-dev_*.deb
 
@@ -116,15 +189,22 @@ jobs:
             --pattern "sertial_*_amd64.deb" --dir /tmp/pkgs
           sudo dpkg -i /tmp/pkgs/sertial_*_amd64.deb
 
-      - name: Build and package
-        run: |
-          cmake --preset default -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build --preset default --parallel $(nproc)
-          cd build/default && cpack -G DEB
+      - name: Configure
+        run: cmake --preset default -DCMAKE_INSTALL_PREFIX=/usr/local
+
+      - name: Build
+        run: cmake --build --preset default --parallel $(nproc)
+
+      - name: Package
+        run: cd build/default && cpack -G DEB
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes || true
           gh release upload "${{ github.ref_name }}" \
             build/default/corerat-std_*_amd64.deb --clobber
+
