@@ -82,7 +82,7 @@ target_compile_definitions(corerat INTERFACE
 target_compile_options(corerat INTERFACE
     -Wall -Wextra -Wpedantic
     $<$<CONFIG:Release>:-O3>
-    $<$<CONFIG:Release>:-march=native>
+    $<$<AND:$<CONFIG:Release>,$<STREQUAL:${CORERAT_PLATFORM},STD>>:-march=native>
 )
 
 if(CORERAT_PLATFORM STREQUAL "EVL")
