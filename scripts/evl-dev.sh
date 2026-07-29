@@ -565,37 +565,42 @@ fi
 
 # Run tests — CMakeLists.txt is the single source of truth for all tests.
 if [[ "$DO_TEST" -eq 1 ]]; then
-    CTEST_PRESET="${DO_BUILD:-evl}"
-
     if [[ -z "$DO_BUILD" && -n "$DO_CROSS" ]]; then
-        # Binary cache: deploy source + binaries into CMake build tree,
-        # reconfigure (fast, ~0.5s — no build, just generates CTestTestfile.cmake
-        # with guest-local paths), then ctest.
-        echo "Deploying source + build/${DO_CROSS}/ to guest for ctest..."
+        # Cross-compile path: binaries built on host, run in guest.
+        # Patch host paths to guest paths in CTestTestfile.cmake (in-place,
+        # host-side) so ctest can find executables and scripts without cmake.
+        host_build_dir="$(realpath "build/${DO_CROSS}")"
+        host_src_dir="$(pwd)"
+        guest_build_dir="/root/CoreRaT/build/evl"
+        guest_src_dir="/root/CoreRaT"
+
+        echo "Patching build paths in CTestTestfile.cmake for guest (host-side)..."
+        find "build/${DO_CROSS}" -name 'CTestTestfile.cmake' \
+            -exec sed -i \
+                -e "s|${host_build_dir}|${guest_build_dir}|g" \
+                -e "s|${host_src_dir}|${guest_src_dir}|g" \
+            '{}' '+'
+
+        echo "Deploying source to guest ${guest_src_dir}/ ..."
         rsync -az --delete \
             --exclude=build --exclude=.git --exclude=CommRaT \
             --exclude=tims --exclude=.evl-cache \
             -e "ssh ${SSH_OPTS}" \
-            ./ "root@127.0.0.1:/root/CoreRaT/"
-        ssh ${SSH_OPTS} root@127.0.0.1 mkdir -p "/root/CoreRaT/build/evl"
+            ./ "root@127.0.0.1:${guest_src_dir}/"
+
+        echo "Deploying build/${DO_CROSS}/ to guest ${guest_build_dir}/ ..."
+        ssh ${SSH_OPTS} root@127.0.0.1 mkdir -p "${guest_build_dir}"
         rsync -az \
             -e "ssh ${SSH_OPTS}" \
-            "build/${DO_CROSS}/" "root@127.0.0.1:/root/CoreRaT/build/evl/"
-        echo "Configuring on guest (generates CTestTestfile.cmake)..."
-        ssh ${SSH_OPTS} root@127.0.0.1 bash -lc "
-            set -euo pipefail
-            cd /root/CoreRaT
-            rm -f build/evl/CMakeCache.txt
-            cmake --preset evl 2>&1
-        "
+            "build/${DO_CROSS}/" "root@127.0.0.1:${guest_build_dir}/"
+    else
+        # In-guest build path: cmake already ran inside the guest.
+        guest_build_dir="/root/CoreRaT/build/${DO_BUILD}"
     fi
 
-    echo "Running ctest --preset ${CTEST_PRESET} on EVL guest..."
-    ssh ${SSH_OPTS} root@127.0.0.1 bash -lc "
-        set -euo pipefail
-        cd /root/CoreRaT
-        ctest --preset ${CTEST_PRESET} --timeout 120 --output-on-failure 2>&1
-    "
+    echo "Running ctest on EVL guest..."
+    ssh ${SSH_OPTS} root@127.0.0.1 \
+        ctest --test-dir "${guest_build_dir}" --output-on-failure --timeout 120
 fi
 
 # Run specific binaries
