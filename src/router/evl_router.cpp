@@ -40,6 +40,7 @@
 #include <vector>
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <poll.h>
@@ -141,6 +142,13 @@ public:
     explicit ServerSocket(std::string_view path) : path_(path) {
         fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd_ < 0) return;
+
+        // Create parent directory if it does not exist
+        const auto sep = path_.rfind('/');
+        if (sep != std::string::npos && sep > 0) {
+            const std::string dir = path_.substr(0, sep);
+            ::mkdir(dir.c_str(), 0755);
+        }
 
         ::unlink(path_.c_str());
 
