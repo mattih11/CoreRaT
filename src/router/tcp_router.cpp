@@ -1,16 +1,19 @@
 /**
  * @file router/tcp_router.cpp
- * @brief CoreRaT TCP message router
+ * @brief CoreRaT TCP message router with inter-router peering (Gap 5)
  *
  * Drop-in replacement for the RACK TimsRouterTcp daemon.
  * Speaks the same TiMS wire protocol on port 2000 so existing CommRaT/RACK
  * nodes interoperate without modification.
  *
- * Each connecting client gets one Connection object and one std::jthread.
- * A shared MailboxRegistry maps mailbox_id → Connection* for routing.
+ * Inter-router peering: use --peer HOST[:PORT] to connect to a peer router
+ * (corerat-router-evl on an EVL host, or another corerat-router-tcp instance).
+ * Peers exchange mailbox registrations using MSG_ROUTER_PEER_HELLO/REGISTER/DELETE.
+ * Data messages are forwarded transparently using the standard TiMS wire format.
  *
  * Usage:
  *   corerat-router-tcp [--port PORT] [--max-msg-size BYTES]
+ *                      [--peer HOST[:PORT]] ...
  */
 
 #include "corerat/ipc/tims/protocol.hpp"
@@ -30,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <netinet/in.h>
@@ -46,41 +50,35 @@ using namespace corerat::tims_proto;
 // ============================================================================
 
 class Connection;
+class TcpRouter;
 
 // ============================================================================
-// MailboxRegistry — thread-safe mailbox_id → Connection mapping
+// MailboxRegistry — thread-safe mailbox_id → Connection* mapping.
+// The same Connection* represents both local-node and peer-router routes.
+// remove_all() cleans up all entries for a connection on disconnect.
 // ============================================================================
 
 class MailboxRegistry {
 public:
-    /// Register mailbox → connection. Returns false if already registered.
     bool add(uint32_t mailbox_id, Connection* con) {
         std::unique_lock lock{mutex_};
         return table_.emplace(mailbox_id, con).second;
     }
 
-    /// Remove a mailbox entry (ignored if not present).
     void remove(uint32_t mailbox_id) {
         std::unique_lock lock{mutex_};
         table_.erase(mailbox_id);
     }
 
-    /// Remove all mailboxes belonging to a connection.
     void remove_all(const Connection* con) {
         std::unique_lock lock{mutex_};
         std::erase_if(table_, [con](const auto& kv){ return kv.second == con; });
     }
 
-    /// Look up a connection by mailbox id; returns nullptr if not found.
     Connection* find(uint32_t mailbox_id) const {
         std::shared_lock lock{mutex_};
         const auto it = table_.find(mailbox_id);
         return it != table_.end() ? it->second : nullptr;
-    }
-
-    std::size_t size() const {
-        std::shared_lock lock{mutex_};
-        return table_.size();
     }
 
 private:
@@ -97,57 +95,52 @@ public:
     explicit ServerSocket(uint16_t port) {
         fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) return;
-
         const int one = 1;
         ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port        = htons(port);
-
         if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 ||
             ::listen(fd_, 32) < 0) {
             ::close(fd_); fd_ = -1;
         }
     }
-
     ~ServerSocket() { if (fd_ >= 0) ::close(fd_); }
-
     ServerSocket(const ServerSocket&) = delete;
     ServerSocket& operator=(const ServerSocket&) = delete;
 
     bool is_open() const noexcept { return fd_ >= 0; }
-
-    /// Poll for an incoming connection with a timeout.  Returns > 0 if a
-    /// connection is ready, 0 on timeout, < 0 on error.
-    int poll_in(int timeout_ms) const noexcept {
+    void close() noexcept { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } }
+    int poll_in(int ms) const noexcept {
         if (fd_ < 0) return -1;
         struct pollfd pfd{fd_, POLLIN, 0};
-        return ::poll(&pfd, 1, timeout_ms);
+        return ::poll(&pfd, 1, ms);
     }
-
-    /// Accept next connection; non-blocking — caller must poll first.
     std::optional<TcpSocket> accept() const noexcept {
-        sockaddr_in client_addr{};
-        socklen_t   addr_len = sizeof(client_addr);
-        const int   cfd = ::accept(fd_,
-                                   reinterpret_cast<sockaddr*>(&client_addr),
-                                   &addr_len);
+        sockaddr_in addr{};
+        socklen_t len = sizeof(addr);
+        const int cfd = ::accept(fd_, reinterpret_cast<sockaddr*>(&addr), &len);
         if (cfd < 0) return std::nullopt;
         TcpSocket s{cfd};
         s.disable_nagle();
         return s;
     }
-
-    void close() noexcept { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } }
-
 private:
     int fd_{-1};
 };
 
 // ============================================================================
-// Connection — one per connected client
+// Connection — one per TCP connection (client node OR peer router)
+//
+// is_peer_ is false for inbound client connections until MSG_ROUTER_PEER_HELLO
+// is received, at which point the connection switches to peer mode and begins
+// advertising. Outbound connections (--peer flag) start with is_peer_=true.
+//
+// Peer mode behaviour:
+//   MSG_ROUTER_PEER_REGISTER(mbx) → registry_.add(mbx, this)
+//   MSG_ROUTER_PEER_DELETE(mbx)   → registry_.remove(mbx)
+//   data messages                 → route to local dest (same as client msgs)
 // ============================================================================
 
 class Connection {
@@ -155,149 +148,135 @@ public:
     Connection(TcpSocket socket,
                MailboxRegistry& registry,
                std::size_t max_msg_size,
-               int index)
+               int index,
+               bool is_peer,
+               TcpRouter* router)
         : socket_(std::move(socket))
         , registry_(registry)
         , max_msg_size_(max_msg_size)
-        , index_(index) {}
+        , index_(index)
+        , is_peer_(is_peer)
+        , router_(router) {}
 
     ~Connection() { registry_.remove_all(this); }
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    /// Forward a message to this connection's socket (thread-safe).
-    bool forward(const FrameHeader& hdr, const std::byte* body,
-                 uint32_t body_len) {
+    bool is_peer() const noexcept { return is_peer_; }
+
+    bool forward(const FrameHeader& hdr, const void* body, uint32_t body_len) {
         std::lock_guard lock{send_mutex_};
         return socket_.send_all(&hdr, sizeof(hdr)) &&
                socket_.send_all(body, body_len);
     }
 
-    /// Main receive loop — runs in its own jthread.
-    void run(std::stop_token stop) {
-        std::vector<std::byte> buf(max_msg_size_);
-
-        while (!stop.stop_requested()) {
-            if (socket_.poll_in(200) <= 0) continue;
-
-            FrameHeader frame{};
-            if (!socket_.recv_all(&frame, sizeof(frame))) break;
-
-            handle_frame(frame, buf);
-        }
-
-        registry_.remove_all(this);
-        std::printf("[TCP router] connection[%d] closed\n", index_);
+    void send_peer_register(uint32_t mbx_id) {
+        MbxInitPayload p{mbx_id};
+        const auto fr = make_frame(MSG_ROUTER_PEER_REGISTER, 0, 0, 0, 0,
+                                   static_cast<uint32_t>(sizeof(p)));
+        std::lock_guard lock{send_mutex_};
+        socket_.send_all(&fr, sizeof(fr));
+        socket_.send_all(&p, sizeof(p));
     }
+
+    void send_peer_delete(uint32_t mbx_id) {
+        MbxInitPayload p{mbx_id};
+        const auto fr = make_frame(MSG_ROUTER_PEER_DELETE, 0, 0, 0, 0,
+                                   static_cast<uint32_t>(sizeof(p)));
+        std::lock_guard lock{send_mutex_};
+        socket_.send_all(&fr, sizeof(fr));
+        socket_.send_all(&p, sizeof(p));
+    }
+
+    void run(std::stop_token stop);
 
 private:
-    void handle_frame(const FrameHeader& frame, std::vector<std::byte>& buf) {
-        const uint32_t body_len = (frame.msglen > static_cast<uint32_t>(sizeof(FrameHeader)))
-                                ? frame.msglen - static_cast<uint32_t>(sizeof(FrameHeader))
-                                : 0u;
-
-        if (body_len > max_msg_size_) {
-            std::fprintf(stderr, "[TCP router] connection[%d] oversized message "
-                     "(%u bytes) from %08x\n", index_, frame.msglen, frame.src);
-            socket_.close(); return;
-        }
-
-        if (body_len > 0 && !socket_.recv_all(buf.data(), body_len)) return;
-
-        switch (frame.type) {
-            case MSG_ROUTER_DISABLE_WATCHDOG:
-                watchdog_enabled_ = false;
-                break;
-
-            case MSG_ROUTER_MBX_INIT_WITH_REPLY: {
-                if (body_len < sizeof(MbxInitPayload)) break;
-                MbxInitPayload payload{};
-                std::memcpy(&payload, buf.data(), sizeof(payload));
-                const bool ok = registry_.add(payload.mbx, this);
-                const auto reply = make_frame(ok ? MSG_OK : MSG_ERROR,
-                                              frame.src, 0, 0, frame.seq_nr, 0);
-                std::lock_guard lock{send_mutex_};
-                socket_.send_all(&reply, sizeof(reply));
-                if (ok) std::printf("[TCP router] registered mailbox %08x "
-                                    "on connection[%d]\n", payload.mbx, index_);
-                break;
-            }
-
-            case MSG_ROUTER_MBX_DELETE: {
-                if (body_len < sizeof(MbxInitPayload)) break;
-                MbxInitPayload payload{};
-                std::memcpy(&payload, buf.data(), sizeof(payload));
-                registry_.remove(payload.mbx);
-                std::printf("[TCP router] deleted mailbox %08x from "
-                            "connection[%d]\n", payload.mbx, index_);
-                break;
-            }
-
-            default: {
-                // Route to destination
-                Connection* dest = registry_.find(frame.dest);
-                if (dest) {
-                    dest->forward(frame, buf.data(), body_len);
-                } else {
-                    // Unknown destination — send error back to sender
-                    const auto err = make_frame(MSG_ERROR, frame.src, 0,
-                                                0, frame.seq_nr, 0);
-                    std::lock_guard lock{send_mutex_};
-                    socket_.send_all(&err, sizeof(err));
-                }
-                break;
-            }
-        }
-    }
+    void advertise_as_peer();
+    void handle_frame(const FrameHeader& frame, std::vector<std::byte>& buf);
 
     TcpSocket        socket_;
     MailboxRegistry& registry_;
     std::size_t      max_msg_size_;
     int              index_;
-    std::mutex       send_mutex_;
+    bool             is_peer_{false};
     bool             watchdog_enabled_{true};
+    std::mutex       send_mutex_;
+    TcpRouter*       router_{nullptr};
 };
 
 // ============================================================================
-// TcpRouter — accept loop + connection lifetime management
+// PeerConfig — address of a peer router daemon
+// ============================================================================
+
+struct PeerConfig {
+    std::string host;
+    uint16_t    port{2000};
+};
+
+// ============================================================================
+// TcpRouter — accept loop + outbound peer connections + mailbox broadcast
 // ============================================================================
 
 class TcpRouter {
 public:
-    TcpRouter(uint16_t port, std::size_t max_msg_size)
-        : server_(port), max_msg_size_(max_msg_size), port_(port) {}
+    TcpRouter(uint16_t port, std::size_t max_msg_size,
+              std::vector<PeerConfig> peers = {})
+        : server_(port)
+        , max_msg_size_(max_msg_size)
+        , port_(port)
+        , peer_configs_(std::move(peers)) {}
 
     bool is_ready() const noexcept { return server_.is_open(); }
+    void stop()                    { server_.close(); }
 
-    /// Close the server socket so a blocked accept() call returns immediately.
-    /// Call this after request_stop() to ensure the run() thread exits promptly.
-    void stop() { server_.close(); }
+    /// Called by Connection when a local client mailbox registers.
+    void on_local_registered(uint32_t mbx_id) {
+        {
+            std::lock_guard lock{local_mutex_};
+            local_mailboxes_.insert(mbx_id);
+        }
+        broadcast_to_peers([mbx_id](Connection* pc){
+            pc->send_peer_register(mbx_id);
+        });
+    }
+
+    /// Called by Connection when a local client mailbox deletes.
+    void on_local_deleted(uint32_t mbx_id) {
+        {
+            std::lock_guard lock{local_mutex_};
+            local_mailboxes_.erase(mbx_id);
+        }
+        broadcast_to_peers([mbx_id](Connection* pc){
+            pc->send_peer_delete(mbx_id);
+        });
+    }
+
+    /// Snapshot of locally registered mailboxes (sent to new peers at connect).
+    std::vector<uint32_t> local_mailboxes_snapshot() const {
+        std::lock_guard lock{local_mutex_};
+        return {local_mailboxes_.begin(), local_mailboxes_.end()};
+    }
 
     void run(std::stop_token stop) {
+        connect_to_peers();
+
         std::printf("[TCP router] listening on port %u\n",
                     static_cast<unsigned>(port_));
 
         while (!stop.stop_requested()) {
-            // Poll with 200 ms timeout so we can check stop_requested regularly
-            // without relying on close() to interrupt a blocked accept() call.
             if (server_.poll_in(200) <= 0) continue;
-
             auto sock = server_.accept();
-            if (!sock) continue;   // spurious wakeup or transient error
+            if (!sock) continue;
 
             const int idx = next_index_++;
             std::printf("[TCP router] new connection[%d]\n", idx);
 
             auto con = std::make_unique<Connection>(
-                std::move(*sock), registry_, max_msg_size_, idx);
-
-            // Launch per-connection jthread; holds a raw pointer safe because
-            // we join before removing from connections_
+                std::move(*sock), registry_, max_msg_size_, idx,
+                false /* not peer yet */, this);
             Connection* raw = con.get();
-            auto thread = std::jthread{[raw](std::stop_token st){
-                raw->run(st);
-            }};
+            auto thread = std::jthread{[raw](std::stop_token st){ raw->run(st); }};
 
             std::lock_guard lock{connections_mutex_};
             connections_.emplace_back(std::move(con), std::move(thread));
@@ -310,6 +289,43 @@ public:
     static constexpr uint16_t kDefaultPort = 2000;
 
 private:
+    void connect_to_peers() {
+        for (const auto& pc : peer_configs_) {
+            TcpSocket sock;
+            if (!sock.connect(pc.host, pc.port)) {
+                std::fprintf(stderr,
+                    "[TCP router] failed to connect to peer %s:%u — "
+                    "will route unknown dests to MSG_ERROR\n",
+                    pc.host.c_str(), static_cast<unsigned>(pc.port));
+                continue;
+            }
+            const int idx = next_index_++;
+            auto con = std::make_unique<Connection>(
+                std::move(sock), registry_, max_msg_size_, idx,
+                true /* is_peer */, this);
+            Connection* raw = con.get();
+            auto thread = std::jthread{[raw](std::stop_token st){ raw->run(st); }};
+            {
+                std::lock_guard lock{connections_mutex_};
+                connections_.emplace_back(std::move(con), std::move(thread));
+            }
+            std::printf("[TCP router] connected to peer %s:%u (connection[%d])\n",
+                        pc.host.c_str(), static_cast<unsigned>(pc.port), idx);
+        }
+    }
+
+    template<typename F>
+    void broadcast_to_peers(F&& fn) {
+        // Snapshot peer pointers under lock; send without holding lock.
+        std::vector<Connection*> peers;
+        {
+            std::lock_guard lock{connections_mutex_};
+            for (const auto& e : connections_)
+                if (e.con->is_peer()) peers.push_back(e.con.get());
+        }
+        for (auto* pc : peers) fn(pc);
+    }
+
     struct Entry {
         std::unique_ptr<Connection> con;
         std::jthread                thread;
@@ -319,14 +335,143 @@ private:
     MailboxRegistry          registry_;
     std::size_t              max_msg_size_;
     uint16_t                 port_;
+    std::vector<PeerConfig>  peer_configs_;
     std::atomic<int>         next_index_{0};
     std::mutex               connections_mutex_;
     std::vector<Entry>       connections_;
+    mutable std::mutex       local_mutex_;
+    std::unordered_set<uint32_t> local_mailboxes_;
 };
 
 // ============================================================================
-// MSG_ERROR constant (not in protocol.hpp — router-only)
+// Connection method implementations
+// (placed after TcpRouter definition to resolve the forward reference)
 // ============================================================================
+
+void Connection::advertise_as_peer() {
+    {
+        const auto hello = make_frame(MSG_ROUTER_PEER_HELLO, 0, 0, 0, 0, 0);
+        std::lock_guard lock{send_mutex_};
+        socket_.send_all(&hello, sizeof(hello));
+    }
+    if (router_) {
+        for (auto mbx : router_->local_mailboxes_snapshot())
+            send_peer_register(mbx);
+    }
+}
+
+void Connection::run(std::stop_token stop) {
+    if (is_peer_) advertise_as_peer();
+
+    std::vector<std::byte> buf(max_msg_size_);
+    while (!stop.stop_requested()) {
+        if (socket_.poll_in(200) <= 0) continue;
+        FrameHeader frame{};
+        if (!socket_.recv_all(&frame, sizeof(frame))) break;
+        handle_frame(frame, buf);
+    }
+
+    registry_.remove_all(this);
+    std::printf("[TCP router] connection[%d] closed%s\n", index_,
+                is_peer_ ? " (peer)" : "");
+}
+
+void Connection::handle_frame(const FrameHeader& frame,
+                               std::vector<std::byte>& buf) {
+    const uint32_t body_len =
+        (frame.msglen > static_cast<uint32_t>(sizeof(FrameHeader)))
+        ? frame.msglen - static_cast<uint32_t>(sizeof(FrameHeader)) : 0u;
+
+    if (body_len > max_msg_size_) {
+        std::fprintf(stderr, "[TCP router] connection[%d] oversized (%u bytes)\n",
+                     index_, frame.msglen);
+        socket_.close(); return;
+    }
+    if (body_len > 0 && !socket_.recv_all(buf.data(), body_len)) return;
+
+    switch (frame.type) {
+        // ── Peer protocol ─────────────────────────────────────────────────
+        case MSG_ROUTER_PEER_HELLO:
+            if (!is_peer_) {
+                is_peer_ = true;
+                advertise_as_peer();
+                std::printf("[TCP router] connection[%d] upgraded to peer\n",
+                            index_);
+            }
+            break;
+
+        case MSG_ROUTER_PEER_REGISTER: {
+            if (!is_peer_ || body_len < sizeof(MbxInitPayload)) break;
+            MbxInitPayload p{};
+            std::memcpy(&p, buf.data(), sizeof(p));
+            if (registry_.add(p.mbx, this))
+                std::printf("[TCP router] peer[%d] registered mailbox %08x\n",
+                            index_, p.mbx);
+            break;
+        }
+
+        case MSG_ROUTER_PEER_DELETE: {
+            if (!is_peer_ || body_len < sizeof(MbxInitPayload)) break;
+            MbxInitPayload p{};
+            std::memcpy(&p, buf.data(), sizeof(p));
+            registry_.remove(p.mbx);
+            std::printf("[TCP router] peer[%d] deleted mailbox %08x\n",
+                        index_, p.mbx);
+            break;
+        }
+
+        // ── Client protocol ───────────────────────────────────────────────
+        case MSG_ROUTER_DISABLE_WATCHDOG:
+            watchdog_enabled_ = false;
+            break;
+
+        case MSG_ROUTER_MBX_INIT_WITH_REPLY: {
+            if (body_len < sizeof(MbxInitPayload)) break;
+            MbxInitPayload payload{};
+            std::memcpy(&payload, buf.data(), sizeof(payload));
+            const bool ok = registry_.add(payload.mbx, this);
+            const auto reply = make_frame(ok ? MSG_OK : MSG_ERROR,
+                                          frame.src, 0, 0, frame.seq_nr, 0);
+            {
+                std::lock_guard lock{send_mutex_};
+                socket_.send_all(&reply, sizeof(reply));
+            }
+            if (ok) {
+                std::printf("[TCP router] registered mailbox %08x "
+                            "on connection[%d]\n", payload.mbx, index_);
+                if (router_) router_->on_local_registered(payload.mbx);
+            }
+            break;
+        }
+
+        case MSG_ROUTER_MBX_DELETE: {
+            if (body_len < sizeof(MbxInitPayload)) break;
+            MbxInitPayload payload{};
+            std::memcpy(&payload, buf.data(), sizeof(payload));
+            registry_.remove(payload.mbx);
+            std::printf("[TCP router] deleted mailbox %08x from "
+                        "connection[%d]\n", payload.mbx, index_);
+            if (router_) router_->on_local_deleted(payload.mbx);
+            break;
+        }
+
+        // ── Data routing ──────────────────────────────────────────────────
+        default: {
+            Connection* dest = registry_.find(frame.dest);
+            if (dest) {
+                dest->forward(frame, buf.data(), body_len);
+            } else if (!is_peer_) {
+                // Send error back to client nodes only (not to peer routers —
+                // avoid spurious errors during peer startup / race conditions).
+                const auto err = make_frame(MSG_ERROR, frame.src, 0,
+                                            0, frame.seq_nr, 0);
+                std::lock_guard lock{send_mutex_};
+                socket_.send_all(&err, sizeof(err));
+            }
+            break;
+        }
+    }
+}
 
 }  // namespace corerat::router
 
@@ -341,6 +486,7 @@ namespace {
 int main(int argc, char* argv[]) {
     uint16_t    port         = corerat::router::TcpRouter::kDefaultPort;
     std::size_t max_msg_size = 256 * 1024;
+    std::vector<corerat::router::PeerConfig> peers;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
@@ -348,16 +494,28 @@ int main(int argc, char* argv[]) {
             port = static_cast<uint16_t>(std::stoul(argv[++i]));
         else if ((arg == "--max-msg-size" || arg == "-m") && i + 1 < argc)
             max_msg_size = std::stoul(argv[++i]);
+        else if ((arg == "--peer" || arg == "-r") && i + 1 < argc) {
+            std::string peer_str{argv[++i]};
+            const auto colon = peer_str.rfind(':');
+            corerat::router::PeerConfig pc;
+            if (colon != std::string::npos) {
+                pc.host = peer_str.substr(0, colon);
+                pc.port = static_cast<uint16_t>(std::stoul(peer_str.substr(colon + 1)));
+            } else {
+                pc.host = peer_str;
+            }
+            peers.push_back(std::move(pc));
+        }
         else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: corerat-router-tcp [--port PORT] [--max-msg-size BYTES]\n");
-                         
+            std::printf("Usage: corerat-router-tcp [--port PORT] "
+                        "[--max-msg-size BYTES] [--peer HOST[:PORT]] ...\n");
             return 0;
         }
     }
 
     ::signal(SIGPIPE, SIG_IGN);
 
-    corerat::router::TcpRouter router{port, max_msg_size};
+    corerat::router::TcpRouter router{port, max_msg_size, std::move(peers)};
     if (!router.is_ready()) {
         std::fprintf(stderr, "Failed to bind port %u\n", static_cast<unsigned>(port));
         return 1;
@@ -373,6 +531,6 @@ int main(int argc, char* argv[]) {
 
     while (!g_shutdown) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     stop.request_stop();
-    router.stop();   // close server socket so accept() unblocks immediately
+    router.stop();
     return 0;
 }
