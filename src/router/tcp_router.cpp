@@ -1,6 +1,6 @@
 /**
  * @file router/tcp_router.cpp
- * @brief CoreRaT TCP message router with inter-router peering (Gap 5)
+ * @brief CoreRaT TCP message router with inter-router peering and upstream forwarding
  *
  * Drop-in replacement for the RACK TimsRouterTcp daemon.
  * Speaks the same TiMS wire protocol on port 2000 so existing CommRaT/RACK
@@ -9,11 +9,15 @@
  * Inter-router peering: use --peer HOST[:PORT] to connect to a peer router
  * (corerat-router-evl on an EVL host, or another corerat-router-tcp instance).
  * Peers exchange mailbox registrations using MSG_ROUTER_PEER_HELLO/REGISTER/DELETE.
- * Data messages are forwarded transparently using the standard TiMS wire format.
+ *
+ * Upstream router (Gap 1): use --upstream HOST[:PORT] to connect this router
+ * as a leaf to a parent router (matching RACK's Router -> System Router link).
+ * Unknown destinations are forwarded upstream rather than answered with MSG_ERROR.
  *
  * Usage:
  *   corerat-router-tcp [--port PORT] [--max-msg-size BYTES]
  *                      [--peer HOST[:PORT]] ...
+ *                      [--upstream HOST[:PORT]]
  */
 
 #include "corerat/ipc/tims/protocol.hpp"
@@ -207,9 +211,16 @@ private:
 
 // ============================================================================
 // PeerConfig — address of a peer router daemon
+// UpstreamConfig — address of a parent router (RACK System Router or another
+//                  corerat-router-* at a higher tier)
 // ============================================================================
 
 struct PeerConfig {
+    std::string host;
+    uint16_t    port{2000};
+};
+
+struct UpstreamConfig {
     std::string host;
     uint16_t    port{2000};
 };
@@ -221,11 +232,13 @@ struct PeerConfig {
 class TcpRouter {
 public:
     TcpRouter(uint16_t port, std::size_t max_msg_size,
-              std::vector<PeerConfig> peers = {})
+              std::vector<PeerConfig> peers = {},
+              std::optional<UpstreamConfig> upstream = {})
         : server_(port)
         , max_msg_size_(max_msg_size)
         , port_(port)
-        , peer_configs_(std::move(peers)) {}
+        , peer_configs_(std::move(peers))
+        , upstream_config_(std::move(upstream)) {}
 
     bool is_ready() const noexcept { return server_.is_open(); }
     void stop()                    { server_.close(); }
@@ -258,8 +271,25 @@ public:
         return {local_mailboxes_.begin(), local_mailboxes_.end()};
     }
 
+    /**
+     * @brief Forward a frame to the upstream router (Gap 1).
+     *
+     * Called by Connection::handle_frame() when the destination is not in the
+     * local registry and the sender is a local client (not a peer).
+     * If the upstream socket is not connected, returns false so the caller
+     * can fall back to sending MSG_ERROR.
+     */
+    bool forward_to_upstream(const FrameHeader& hdr,
+                             const void* body, uint32_t body_len) {
+        std::lock_guard lock{upstream_send_mutex_};
+        if (!upstream_socket_.is_open()) return false;
+        return upstream_socket_.send_all(&hdr, sizeof(hdr)) &&
+               (body_len == 0 || upstream_socket_.send_all(body, body_len));
+    }
+
     void run(std::stop_token stop) {
         connect_to_peers();
+        connect_to_upstream();
 
         std::printf("[TCP router] listening on port %u\n",
                     static_cast<unsigned>(port_));
@@ -289,6 +319,53 @@ public:
     static constexpr uint16_t kDefaultPort = 2000;
 
 private:
+    void connect_to_upstream() {
+        if (!upstream_config_) return;
+        if (!upstream_socket_.connect(upstream_config_->host, upstream_config_->port)) {
+            std::fprintf(stderr,
+                "[TCP router] failed to connect to upstream %s:%u — "
+                "unknown dests will get MSG_ERROR\n",
+                upstream_config_->host.c_str(),
+                static_cast<unsigned>(upstream_config_->port));
+            return;
+        }
+        std::printf("[TCP router] connected to upstream %s:%u\n",
+                    upstream_config_->host.c_str(),
+                    static_cast<unsigned>(upstream_config_->port));
+        upstream_thread_ = std::jthread{[this](std::stop_token st){
+            run_upstream_reader(st);
+        }};
+    }
+
+    /**
+     * @brief Read frames coming back from the upstream router (Gap 1).
+     *
+     * The upstream router may send data (forwarded from a remote host) or
+     * MSG_ERROR replies.  Both are routed into the local registry just like
+     * any inbound frame, so the originating local client receives its reply.
+     */
+    void run_upstream_reader(std::stop_token stop) {
+        std::vector<std::byte> buf(max_msg_size_);
+        while (!stop.stop_requested()) {
+            if (upstream_socket_.poll_in(200) <= 0) continue;
+            FrameHeader frame{};
+            if (!upstream_socket_.recv_all(&frame, sizeof(frame))) break;
+
+            const uint32_t body_len =
+                (frame.msglen > static_cast<uint32_t>(sizeof(FrameHeader)))
+                ? frame.msglen - static_cast<uint32_t>(sizeof(FrameHeader)) : 0u;
+            if (body_len > max_msg_size_) { upstream_socket_.close(); break; }
+            if (body_len > 0 &&
+                !upstream_socket_.recv_all(buf.data(), body_len)) break;
+
+            // Route the reply back to the local client that originated it.
+            Connection* dest = registry_.find(frame.dest);
+            if (dest) dest->forward(frame, buf.data(), body_len);
+        }
+        std::printf("[TCP router] upstream connection closed\n");
+        upstream_socket_.close();
+    }
+
     void connect_to_peers() {
         for (const auto& pc : peer_configs_) {
             TcpSocket sock;
@@ -331,16 +408,20 @@ private:
         std::jthread                thread;
     };
 
-    ServerSocket             server_;
-    MailboxRegistry          registry_;
-    std::size_t              max_msg_size_;
-    uint16_t                 port_;
-    std::vector<PeerConfig>  peer_configs_;
-    std::atomic<int>         next_index_{0};
-    std::mutex               connections_mutex_;
-    std::vector<Entry>       connections_;
-    mutable std::mutex       local_mutex_;
-    std::unordered_set<uint32_t> local_mailboxes_;
+    ServerSocket                   server_;
+    MailboxRegistry                registry_;
+    std::size_t                    max_msg_size_;
+    uint16_t                       port_;
+    std::vector<PeerConfig>        peer_configs_;
+    std::optional<UpstreamConfig>  upstream_config_;
+    TcpSocket                      upstream_socket_;
+    std::mutex                     upstream_send_mutex_;
+    std::jthread                   upstream_thread_;
+    std::atomic<int>               next_index_{0};
+    std::mutex                     connections_mutex_;
+    std::vector<Entry>             connections_;
+    mutable std::mutex             local_mutex_;
+    std::unordered_set<uint32_t>   local_mailboxes_;
 };
 
 // ============================================================================
@@ -461,12 +542,18 @@ void Connection::handle_frame(const FrameHeader& frame,
             if (dest) {
                 dest->forward(frame, buf.data(), body_len);
             } else if (!is_peer_) {
-                // Send error back to client nodes only (not to peer routers —
-                // avoid spurious errors during peer startup / race conditions).
-                const auto err = make_frame(MSG_ERROR, frame.src, 0,
-                                            0, frame.seq_nr, 0);
-                std::lock_guard lock{send_mutex_};
-                socket_.send_all(&err, sizeof(err));
+                // Gap 1: try upstream router before answering MSG_ERROR.
+                // Peer routers are excluded — they handle their own errors.
+                if (router_ &&
+                    router_->forward_to_upstream(frame, buf.data(), body_len)) {
+                    // Forwarded upstream; reply (if any) arrives via the
+                    // upstream reader thread and is routed back to frame.src.
+                } else {
+                    const auto err = make_frame(MSG_ERROR, frame.src, 0,
+                                                0, frame.seq_nr, 0);
+                    std::lock_guard lock{send_mutex_};
+                    socket_.send_all(&err, sizeof(err));
+                }
             }
             break;
         }
@@ -486,7 +573,17 @@ namespace {
 int main(int argc, char* argv[]) {
     uint16_t    port         = corerat::router::TcpRouter::kDefaultPort;
     std::size_t max_msg_size = 256 * 1024;
-    std::vector<corerat::router::PeerConfig> peers;
+    std::vector<corerat::router::PeerConfig>    peers;
+    std::optional<corerat::router::UpstreamConfig> upstream_config;
+
+    auto parse_host_port = [](const std::string& s, uint16_t default_port)
+        -> std::pair<std::string, uint16_t> {
+        const auto colon = s.rfind(':');
+        if (colon != std::string::npos)
+            return {s.substr(0, colon),
+                    static_cast<uint16_t>(std::stoul(s.substr(colon + 1)))};
+        return {s, default_port};
+    };
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
@@ -495,27 +592,27 @@ int main(int argc, char* argv[]) {
         else if ((arg == "--max-msg-size" || arg == "-m") && i + 1 < argc)
             max_msg_size = std::stoul(argv[++i]);
         else if ((arg == "--peer" || arg == "-r") && i + 1 < argc) {
-            std::string peer_str{argv[++i]};
-            const auto colon = peer_str.rfind(':');
-            corerat::router::PeerConfig pc;
-            if (colon != std::string::npos) {
-                pc.host = peer_str.substr(0, colon);
-                pc.port = static_cast<uint16_t>(std::stoul(peer_str.substr(colon + 1)));
-            } else {
-                pc.host = peer_str;
-            }
-            peers.push_back(std::move(pc));
+            auto [host, pport] = parse_host_port(argv[++i],
+                                                 corerat::router::TcpRouter::kDefaultPort);
+            peers.push_back({std::move(host), pport});
+        }
+        else if ((arg == "--upstream" || arg == "-u") && i + 1 < argc) {
+            auto [host, uport] = parse_host_port(argv[++i],
+                                                 corerat::router::TcpRouter::kDefaultPort);
+            upstream_config = corerat::router::UpstreamConfig{std::move(host), uport};
         }
         else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: corerat-router-tcp [--port PORT] "
-                        "[--max-msg-size BYTES] [--peer HOST[:PORT]] ...\n");
+                        "[--max-msg-size BYTES] [--peer HOST[:PORT]] ..."
+                        " [--upstream HOST[:PORT]]\n");
             return 0;
         }
     }
 
     ::signal(SIGPIPE, SIG_IGN);
 
-    corerat::router::TcpRouter router{port, max_msg_size, std::move(peers)};
+    corerat::router::TcpRouter router{port, max_msg_size,
+                                      std::move(peers), std::move(upstream_config)};
     if (!router.is_ready()) {
         std::fprintf(stderr, "Failed to bind port %u\n", static_cast<unsigned>(port));
         return 1;

@@ -134,7 +134,7 @@ Only 6 combinations of (source type, destination type, location) are possible:
 | C | EVL | STD | Always remote (host types differ → different hosts) | ✅ Fully implemented (`fbe23e1` + `53f884f`) |
 | D | STD | EVL | Always remote | ✅ Fully implemented (`fbe23e1` + `53f884f`) |
 | E | STD | STD | Same host (different processes) | ✅ Implemented |
-| F | STD | STD | Remote host | ❌ Gap 1 + Gap 5 needed |
+| F | STD | STD | Remote host | ✅ Implemented (`53f884f`) |
 
 EVL→STD same-host and STD→EVL same-host are **impossible** — a host runs either
 `corerat-router-evl` or `corerat-router-tcp`, never both.
@@ -284,7 +284,7 @@ sequenceDiagram
 | **Transport** | TCP → router A → TCP → router B → TCP | Two router hops |
 | **Receive** | STD receiver thread | `recv()` on TCP — existing |
 | **EVL demotion** | N/A | |
-| **Implemented** | ❌ No — requires Gap 1/5 (inter-router peering + mailbox advertisement) | |
+| **Implemented** | ✅ Yes (`53f884f`) — both STD routers started with `--peer <other>:2000`; `PEER_REGISTER` exchange carries mailbox advertisements; data forwarded via `Kind::Peer` connection. Verified by `test_router_peer` (A→B and B→A). | |
 
 ### Routing decision flow — who decides what and when
 
@@ -382,7 +382,7 @@ is where the code runs (kernel vs user space):
 | **Single receive call** | `tims_recvmsg()` unified local, RTnet, TCP in kernel | `evl_poll` on ring_event + oob_sock + xbuf — same unification in user space |
 | **Route discovery** | RTnet used ARP-like dynamic discovery for RT peers | CoreRaT B uses static `EvlNetworkConfig::routes[]` — **no dynamic discovery yet** (potential future gap) |
 | **Router registration protocol** | TiMS router protocol over RTnet/TCP — same wire format for both | CoreRaT uses same TiMS TCP wire protocol for both router types (port 2000) |
-| **Router hierarchy** | Three tiers (Router → System Router → Top Level) | Currently flat — Gap 1 |
+| **Router hierarchy** | Three tiers (Router → System Router → Top Level) | Two-tier supported via `--upstream`; `--peer` for lateral — Gap 1 closed |
 
 The key architectural insight is identical in both systems: **the router is never on
 the hot path for same-host or RT-to-RT communication.** It only participates in
@@ -453,7 +453,7 @@ POSIX SHM + EVL sync is the intended pattern, not a workaround.
 | C | ✅ Implemented (`fbe23e1` + `53f884f`) | — |
 | D | ✅ Implemented (`fbe23e1` + `53f884f`) | — |
 | E | ✅ Implemented | — |
-| F | ❌ Not implemented | Gap 1 (hierarchical routing) |
+| F | ✅ Implemented (`53f884f`) | — |
 
 ### Why no kernel module
 
@@ -493,7 +493,7 @@ Top Level Router            ← knows all mailboxes across all systems
 
 **Severity**: High  
 **Affects**: Cross-host and cross-system communication  
-**Status**: Design agreed, not yet implemented
+**Status**: ✅ Implemented — `--upstream HOST[:PORT]` flag added to both routers
 
 ### RACK behaviour
 Routers form a three-tier hierarchy (Router → System Router → Top Level Router).
@@ -503,12 +503,15 @@ which delivers locally. No component code changes are needed regardless of wheth
 the destination is local or remote.
 
 ### CoreRaT current state
-`corerat-router-tcp` is a **flat, single-level router**. It maintains one `mailbox_id → Connection*`
-table. If the destination is not registered locally, it sends `MSG_ERROR` back to the sender.
-There is no forwarding to any higher-level router. Inter-host communication only works if all
-nodes connect to the **same** router instance.
+`corerat-router-tcp` and `corerat-router-evl` both support an optional
+`--upstream HOST[:PORT]` flag. When a message arrives for a destination not in the
+local registry, and the sender is a local client (not a peer router), the frame is
+forwarded to the upstream connection rather than answered with `MSG_ERROR`. Replies
+(including `MSG_ERROR` from the upstream) are routed back to the local sender via
+a dedicated upstream-reader thread.
 
-`corerat-router-evl` is a name-service only (see Gap 6).
+Combined with `--peer` for lateral peering (`53f884f`), this enables both flat-star
+(all hosts connect to one central router) and two-tier (leaf → system router) topologies.
 
 ### Agreed design
 A **flat star topology** (all hosts connect to one central `corerat-router-tcp` instance) is
@@ -516,18 +519,11 @@ sufficient for single-robot systems and is the first milestone. RACK's full thre
 (Router → System Router → Top Level Router) is the long-term target for multi-robot fleets but
 is not required before the xbuf bridge (Gap 2) is implemented.
 
-For the flat star case, all nodes on all hosts connect to the same `corerat-router-tcp` port.
-The router's `mailbox_id → Kind` table already supports any client type (TCP or Xbuf)
-regardless of which host they are on. Cross-host delivery to STD nodes is just a TCP forward;
-cross-host delivery to EVL nodes is a `write(xbuf_fd)` on the fd opened by the router at
-registration time (the xbuf fd is valid cross-host because it was opened via `/dev/evl/xbuf/`
-on the router's local host — this only works if the EVL node and the router are co-located,
-which is always true by definition for path ③).
-
 ### Action items
-- [ ] Add an optional `--upstream-router HOST:PORT` flag to `corerat-router-tcp` so it can
-      forward unknown destinations to a configured upstream instance (matching RACK's
-      Router → System Router link). Prerequisite for transport paths ④ ⑤ ⑦ in the matrix.
+- [x] Add `--upstream HOST[:PORT]` flag to `corerat-router-tcp` — forward unknown destinations
+      to an upstream router instance (matching RACK's Router → System Router link).
+- [x] Add `--upstream HOST[:PORT]` flag to `corerat-router-evl` — same upstream support for
+      EVL hosts.
 - [ ] Add `system_id` extraction from `mailbox_id[31:24]` so the router can select the
       correct upstream connection for cross-system (multi-robot) addressing (Gap 8).
 
@@ -537,7 +533,7 @@ which is always true by definition for path ③).
 
 **Severity**: Critical  
 **Affects**: Any system running both EVL and STD nodes  
-**Status**: ✅ Fully implemented (`fbe23e1` + `53f884f`) — all six scenarios A–E complete; F pending Gap 1
+**Status**: ✅ Fully implemented (`fbe23e1` + `53f884f`) — all six scenarios A–F complete
 
 ### RACK behaviour
 TiMS was a kernel module (Xenomai 2/3). It could reach RT threads from non-RT code via
@@ -697,8 +693,8 @@ only exists between client and router.
       PEER_HELLO handshake, bidirectional PEER_REGISTER/DELETE exchange (`53f884f`).
 - [x] Integration test: `test_router_peer` verifies A→B and B→A cross-router
       forwarding + PEER_DELETE propagation (`53f884f`).
-- [ ] Gap 1 hierarchical routing (Router → System Router) still needed for
-      multi-system (fleet) deployments.
+- [x] Gap 1 hierarchical routing (Router → System Router) implemented via `--upstream`
+      flag on both routers.
 
 ---
 
@@ -777,8 +773,8 @@ lookup. There is no concept of forwarding to a different system based on system_
 
 ### Action items
 - [ ] No immediate action needed for single-robot use.
-- [ ] When Gap 1 is addressed (hierarchical routing), system_id-based inter-system
-      forwarding should be part of the design.
+- [ ] Gap 1 `--upstream` provides the forwarding hook; system_id-based inter-system
+      routing (Gap 8) should build on top of it.
 
 ---
 
@@ -813,15 +809,15 @@ because it is just a request/reply message exchange.
 
 | # | Gap | Severity | Status |
 |---|-----|----------|--------|
-| 1 | No hierarchical routing (flat TCP router only) | High | Design agreed; flat-star first, upstream peering next |
-| 2 | No RT ↔ non-RT interoperability | **Critical** | **Design agreed (xbuf in EVL router); implementation pending** |
-| 3 | Backend selected per-binary, not per-mailbox | Medium | **Closed** — resolved by Gap 2 xbuf design |
-| 4 | No byte-order conversion on receive | Low | **Mostly resolved** — SeRTial `swap_endianness_from<T>()` available |
-| 5 | No router mailbox advertisement protocol | Medium | Open (required for remote-host paths ④ ⑦) |
-| 6 | EVL router is name-service only, must become full router | **High** | **Design agreed; major rewrite pending (prerequisite for Gap 2)** |
+| 1 | No hierarchical routing (flat TCP router only) | High | ✅ Implemented — `--upstream` added to both routers |
+| 2 | No RT ↔ non-RT interoperability | **Critical** | ✅ Implemented — xbuf bridge in EVL router (`fbe23e1`) |
+| 3 | Backend selected per-binary, not per-mailbox | Medium | ✅ Closed — resolved by Gap 2 xbuf design |
+| 4 | No byte-order conversion on receive | Low | ✅ Implemented — `sertial::swap_endianness_from` wired in `tims_backend.cpp` |
+| 5 | No router mailbox advertisement protocol | Medium | ✅ Implemented — `--peer` peering (`53f884f`) |
+| 6 | EVL router is name-service only, must become full router | **High** | ✅ Implemented — full xbuf-bridge EVL router (`fbe23e1`) |
 | 7 | Remote handle cache capped at 16 (EVL Public mode) | Low | Open |
-| 8 | No cross-system (system_id) routing in TCP router | Low | Open (design with Gap 1) |
-| 9 | No pub/sub at IPC layer (by design) | Low | Closed (CommRaT concern) |
+| 8 | No cross-system (system_id) routing in TCP router | Low | Open (design with Gap 1 follow-up) |
+| 9 | No pub/sub at IPC layer (by design) | Low | ✅ Closed (CommRaT concern) |
 
 ---
 

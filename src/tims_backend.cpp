@@ -1,6 +1,8 @@
 #include "corerat/ipc/tims/tims_backend.hpp"
 #include "corerat/ipc/tims/protocol.hpp"
 #include <cerrno>
+#include <bit>
+#include <sertial/core/endian.hpp>
 
 namespace corerat {
 
@@ -148,6 +150,18 @@ ssize_t TimsMailbox::receive_raw(void* buffer, std::size_t buffer_size,
         if (body_len > buffer_size) return -EMSGSIZE;
 
         if (!socket_.recv_all(buffer, body_len)) return -1;
+
+        // Byte-order conversion (Gap 4).
+        // The FrameHeader.flags field encodes the sender's byte order via
+        // FRAME_LE_FLAG (0x03).  On all current LE targets this is a no-op.
+        // On a hypothetical big-endian sender, swap WireHeader fields in-place.
+        if (body_len >= sizeof(WireHeader)) {
+            const auto sender_endian = (frame.flags & FRAME_LE_FLAG)
+                ? std::endian::little : std::endian::big;
+            sertial::swap_endianness_from<WireHeader>(
+                std::span<std::byte>(static_cast<std::byte*>(buffer), sizeof(WireHeader)),
+                sender_endian);
+        }
 
         if (metadata) {
             metadata->src      = frame.src;
