@@ -131,8 +131,8 @@ Only 6 combinations of (source type, destination type, location) are possible:
 |----|--------|-------------|----------|--------|
 | A | EVL | EVL | Same host (different processes) | ✅ Implemented |
 | B | EVL | EVL | Remote host | ✅ Implemented |
-| C | EVL | STD | Always remote (host types differ → different hosts) | ⚠️ Partial — xbuf send path done; Gap 5 needed |
-| D | STD | EVL | Always remote | ⚠️ Partial — xbuf receive path done; Gap 5 needed |
+| C | EVL | STD | Always remote (host types differ → different hosts) | ✅ Fully implemented (`fbe23e1` + `53f884f`) |
+| D | STD | EVL | Always remote | ✅ Fully implemented (`fbe23e1` + `53f884f`) |
 | E | STD | STD | Same host (different processes) | ✅ Implemented |
 | F | STD | STD | Remote host | ❌ Gap 1 + Gap 5 needed |
 
@@ -208,7 +208,7 @@ sequenceDiagram
 | **Transport** | xbuf outbound ring → TCP → TCP | EVL router: `read(xbuf_fd)` → TCP to STD router → TCP to dest node |
 | **Receive** | STD receiver thread | `recv()` on TCP socket — existing `TimsMailbox::receive_raw()` |
 | **EVL demotion** | Sender only | ✅ `oob_write` is OOB-safe. STD receiver is in-band by nature. |
-| **Implemented** | ⚠️ Partial (`fbe23e1`) — EVL send via `oob_write(xbuf_fd_)` + EVL router xbuf→TCP path done; inter-router TCP peering (Gap 5) still needed for cross-host delivery | |
+| **Implemented** | ✅ Fully implemented (`fbe23e1` + `53f884f`) — EVL send via `oob_write(xbuf_fd_)`, EVL router xbuf→TCP, inter-router peering carries the message to the STD router, TCP→STD node | |
 
 ### Scenario D — STD → EVL, remote host
 
@@ -234,7 +234,7 @@ sequenceDiagram
 | **Transport** | TCP → TCP → xbuf inbound ring | EVL router does a plain `write(xbuf_fd)` — no EVL attachment needed in the router thread |
 | **Receive** | EVL receiver thread | `oob_read(xbuf_fd)` — OOB-safe |
 | **EVL demotion** | Receiver only | ✅ `oob_read` is OOB-safe |
-| **Implemented** | ⚠️ Partial (`fbe23e1`) — STD send via TCP + EVL router `write(xbuf_fd)` + EVL `oob_read(xbuf_fd_)` done; inter-router TCP peering (Gap 5) still needed for cross-host delivery | |
+| **Implemented** | ✅ Fully implemented (`fbe23e1` + `53f884f`) — STD send via TCP, STD router peer-forwards to EVL router, `write(xbuf_fd)`, EVL `oob_read(xbuf_fd_)` | |
 
 ### Scenario E — STD → STD, same host
 
@@ -450,10 +450,10 @@ POSIX SHM + EVL sync is the intended pattern, not a workaround.
 |----------|--------|---------------|
 | A | ✅ Implemented | — |
 | B | ✅ Implemented | — |
-| C | ⚠️ Partial (`fbe23e1`) | Gap 5 (inter-router peering for cross-host delivery) |
-| D | ⚠️ Partial (`fbe23e1`) | Gap 5 (inter-router peering for cross-host delivery) |
+| C | ✅ Implemented (`fbe23e1` + `53f884f`) | — |
+| D | ✅ Implemented (`fbe23e1` + `53f884f`) | — |
 | E | ✅ Implemented | — |
-| F | ❌ Not implemented | Gap 1, Gap 5 (inter-router peering) |
+| F | ❌ Not implemented | Gap 1 (hierarchical routing) |
 
 ### Why no kernel module
 
@@ -537,7 +537,7 @@ which is always true by definition for path ③).
 
 **Severity**: Critical  
 **Affects**: Any system running both EVL and STD nodes  
-**Status**: ✅ Partially implemented (commit `fbe23e1`) — same-host xbuf bridge complete; inter-router TCP peering (Gap 5) still needed for full cross-host Scenario C/D routing
+**Status**: ✅ Fully implemented (`fbe23e1` + `53f884f`) — all six scenarios A–E complete; F pending Gap 1
 
 ### RACK behaviour
 TiMS was a kernel module (Xenomai 2/3). It could reach RT threads from non-RT code via
@@ -676,7 +676,8 @@ sertial::swap_endianness_from<WireHeader>(buffer, sender_endian);
 ## Gap 5 — No Router Mailbox Advertisement (Router-to-Router Protocol)
 
 **Severity**: Medium (prerequisite for Gap 1 fix)  
-**Affects**: Multi-host routing
+**Affects**: Multi-host routing  
+**Status**: ✅ Implemented (commit `53f884f`)
 
 ### RACK behaviour
 When a component registers a mailbox with its local TiMS router, the router informs its
@@ -689,9 +690,15 @@ inform any other router instance about locally known mailboxes. `MSG_ROUTER_MBX_
 only exists between client and router.
 
 ### Action items
-- [ ] Design a router-to-router sub-protocol on top of the existing TCP connection
-      (or a separate port) for mailbox advertisement.
-- [ ] This is a dependency of Gap 1.
+- [x] Design a router-to-router sub-protocol on top of the existing TCP connection
+      for mailbox advertisement (`MSG_ROUTER_PEER_HELLO/REGISTER/DELETE`, types 20-22,
+      commit `53f884f`).
+- [x] Both routers support `--peer HOST[:PORT]` at startup — outbound connection,
+      PEER_HELLO handshake, bidirectional PEER_REGISTER/DELETE exchange (`53f884f`).
+- [x] Integration test: `test_router_peer` verifies A→B and B→A cross-router
+      forwarding + PEER_DELETE propagation (`53f884f`).
+- [ ] Gap 1 hierarchical routing (Router → System Router) still needed for
+      multi-system (fleet) deployments.
 
 ---
 

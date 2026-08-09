@@ -40,6 +40,21 @@ if(CORERAT_BUILD_ROUTERS)
     set_tests_properties(test_router_tcp PROPERTIES
         TIMEOUT 15
         LABELS  "integration")
+
+    # ---- Inter-router peering test (Gap 5) ----
+    add_executable(test_router_peer test_router_peer.cpp)
+    target_link_libraries(test_router_peer PRIVATE corerat)
+    if(CORERAT_IPC STREQUAL "TIMS")
+        target_link_libraries(test_router_peer PRIVATE corerat_tims)
+    endif()
+
+    add_test(NAME test_router_peer
+        COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_router_peer_test.sh
+            $<TARGET_FILE:corerat-router-tcp>
+            $<TARGET_FILE:test_router_peer>)
+    set_tests_properties(test_router_peer PROPERTIES
+        TIMEOUT 15
+        LABELS  "integration")
 endif()
 
 # ============================================================================
