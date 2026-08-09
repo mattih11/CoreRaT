@@ -120,13 +120,13 @@ if(CORERAT_BUILD_ROUTERS)
     target_link_libraries(corerat-router-tcp PRIVATE corerat)
     install(TARGETS corerat-router-tcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-    # EVL router — only on EVL platform (uses no EVL kernel primitives itself,
-    # but is only useful when the target runs the EVL kernel)
-    if(CORERAT_PLATFORM STREQUAL "EVL")
-        add_executable(corerat-router-evl src/router/evl_router.cpp)
-        target_link_libraries(corerat-router-evl PRIVATE corerat)
-        install(TARGETS corerat-router-evl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    endif()
+    # EVL router — full TCP router with xbuf bridge (no EVL headers needed here;
+    # it probes /dev/evl/xbuf/* at runtime using plain open(2)).
+    # Built on all platforms so it can be deployed to EVL hosts from the cross-
+    # compile preset.
+    add_executable(corerat-router-evl src/router/evl_router.cpp)
+    target_link_libraries(corerat-router-evl PRIVATE corerat)
+    install(TARGETS corerat-router-evl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # ============================================================================
