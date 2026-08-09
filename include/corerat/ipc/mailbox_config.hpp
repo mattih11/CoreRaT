@@ -128,6 +128,12 @@ struct MailboxConfig {
     static constexpr uint8_t kMaxNetworkRoutes = 8;
     std::array<NetworkRoute, kMaxNetworkRoutes> network_routes{};
     uint8_t  network_route_count{0};
+
+    /// EVL Public mode only: maximum number of remote SHM handles cached in
+    /// EvlMailbox.  Each cached handle holds an open mmap + evl_mutex/event
+    /// for one peer mailbox.  When the cache is full the least recently used
+    /// handle is evicted (LRU policy).  Ignored on STD/TIMS platform.
+    uint32_t max_remote_handles{16};
 };
 
 } // namespace corerat

@@ -225,6 +225,23 @@ struct UpstreamConfig {
     uint16_t    port{2000};
 };
 
+/// Direct route to a specific RACK/TiMS system (system_id = dest[31:24]).
+/// When the top 8 bits of the destination mailbox match system_id, the frame
+/// is forwarded to this host rather than the generic --upstream connection.
+struct SystemRouteConfig {
+    uint8_t     system_id{0};
+    std::string host;
+    uint16_t    port{2000};
+};
+
+/// Persistent TCP connection to an upstream or system-route router.
+struct SystemConnection {
+    uint8_t      system_id{0};
+    TcpSocket    socket;
+    std::mutex   send_mutex;
+    std::jthread reader_thread;
+};
+
 // ============================================================================
 // TcpRouter — accept loop + outbound peer connections + mailbox broadcast
 // ============================================================================
@@ -233,12 +250,14 @@ class TcpRouter {
 public:
     TcpRouter(uint16_t port, std::size_t max_msg_size,
               std::vector<PeerConfig> peers = {},
-              std::optional<UpstreamConfig> upstream = {})
+              std::optional<UpstreamConfig> upstream = {},
+              std::vector<SystemRouteConfig> system_routes = {})
         : server_(port)
         , max_msg_size_(max_msg_size)
         , port_(port)
         , peer_configs_(std::move(peers))
-        , upstream_config_(std::move(upstream)) {}
+        , upstream_config_(std::move(upstream))
+        , system_route_configs_(std::move(system_routes)) {}
 
     bool is_ready() const noexcept { return server_.is_open(); }
     void stop()                    { server_.close(); }
@@ -272,15 +291,27 @@ public:
     }
 
     /**
-     * @brief Forward a frame to the upstream router (Gap 1).
+     * @brief Forward a frame to the upstream router (Gap 1 + Gap 8).
      *
-     * Called by Connection::handle_frame() when the destination is not in the
-     * local registry and the sender is a local client (not a peer).
-     * If the upstream socket is not connected, returns false so the caller
-     * can fall back to sending MSG_ERROR.
+     * Extracts system_id from dest[31:24]. If a --system-route matches, the
+     * frame is forwarded to that system's dedicated connection (Gap 8).
+     * Otherwise falls back to the generic --upstream connection (Gap 1).
+     * Returns false if no suitable upstream is available so the caller can
+     * fall back to MSG_ERROR.
      */
     bool forward_to_upstream(const FrameHeader& hdr,
                              const void* body, uint32_t body_len) {
+        const uint8_t sys_id = static_cast<uint8_t>((hdr.dest >> 24) & 0xFF);
+        // Gap 8: per-system-id route
+        for (auto& sc : system_connections_) {
+            if (sc->system_id == sys_id) {
+                std::lock_guard lock{sc->send_mutex};
+                return sc->socket.is_open() &&
+                       sc->socket.send_all(&hdr, sizeof(hdr)) &&
+                       (body_len == 0 || sc->socket.send_all(body, body_len));
+            }
+        }
+        // Gap 1: default upstream
         std::lock_guard lock{upstream_send_mutex_};
         if (!upstream_socket_.is_open()) return false;
         return upstream_socket_.send_all(&hdr, sizeof(hdr)) &&
@@ -290,6 +321,7 @@ public:
     void run(std::stop_token stop) {
         connect_to_peers();
         connect_to_upstream();
+        connect_to_system_routes();
 
         std::printf("[TCP router] listening on port %u\n",
                     static_cast<unsigned>(port_));
@@ -333,37 +365,60 @@ private:
                     upstream_config_->host.c_str(),
                     static_cast<unsigned>(upstream_config_->port));
         upstream_thread_ = std::jthread{[this](std::stop_token st){
-            run_upstream_reader(st);
+            run_connection_reader(st, upstream_socket_);
+            std::printf("[TCP router] upstream connection closed\n");
         }};
     }
 
+    void connect_to_system_routes() {
+        for (const auto& rc : system_route_configs_) {
+            auto sc = std::make_unique<SystemConnection>();
+            sc->system_id = rc.system_id;
+            if (!sc->socket.connect(rc.host, rc.port)) {
+                std::fprintf(stderr,
+                    "[TCP router] failed to connect to system route "
+                    "sysid=%u %s:%u\n",
+                    rc.system_id, rc.host.c_str(),
+                    static_cast<unsigned>(rc.port));
+                continue;
+            }
+            std::printf("[TCP router] connected to system route "
+                        "sysid=%u @ %s:%u\n",
+                        rc.system_id, rc.host.c_str(),
+                        static_cast<unsigned>(rc.port));
+            TcpSocket& sock_ref = sc->socket;
+            sc->reader_thread = std::jthread{[this, &sock_ref](std::stop_token st) {
+                run_connection_reader(st, sock_ref);
+                std::printf("[TCP router] system route connection closed\n");
+            }};
+            system_connections_.push_back(std::move(sc));
+        }
+    }
+
     /**
-     * @brief Read frames coming back from the upstream router (Gap 1).
+     * @brief Read frames from an upstream or system-route connection.
      *
-     * The upstream router may send data (forwarded from a remote host) or
-     * MSG_ERROR replies.  Both are routed into the local registry just like
-     * any inbound frame, so the originating local client receives its reply.
+     * Routes replies back into the local registry so the originating local
+     * client receives them.  Used by both the default upstream thread and
+     * per-system-id route threads.
      */
-    void run_upstream_reader(std::stop_token stop) {
+    void run_connection_reader(std::stop_token stop, TcpSocket& socket) {
         std::vector<std::byte> buf(max_msg_size_);
         while (!stop.stop_requested()) {
-            if (upstream_socket_.poll_in(200) <= 0) continue;
+            if (socket.poll_in(200) <= 0) continue;
             FrameHeader frame{};
-            if (!upstream_socket_.recv_all(&frame, sizeof(frame))) break;
+            if (!socket.recv_all(&frame, sizeof(frame))) break;
 
             const uint32_t body_len =
                 (frame.msglen > static_cast<uint32_t>(sizeof(FrameHeader)))
                 ? frame.msglen - static_cast<uint32_t>(sizeof(FrameHeader)) : 0u;
-            if (body_len > max_msg_size_) { upstream_socket_.close(); break; }
-            if (body_len > 0 &&
-                !upstream_socket_.recv_all(buf.data(), body_len)) break;
+            if (body_len > max_msg_size_) { socket.close(); break; }
+            if (body_len > 0 && !socket.recv_all(buf.data(), body_len)) break;
 
-            // Route the reply back to the local client that originated it.
             Connection* dest = registry_.find(frame.dest);
             if (dest) dest->forward(frame, buf.data(), body_len);
         }
-        std::printf("[TCP router] upstream connection closed\n");
-        upstream_socket_.close();
+        socket.close();
     }
 
     void connect_to_peers() {
@@ -408,20 +463,22 @@ private:
         std::jthread                thread;
     };
 
-    ServerSocket                   server_;
-    MailboxRegistry                registry_;
-    std::size_t                    max_msg_size_;
-    uint16_t                       port_;
-    std::vector<PeerConfig>        peer_configs_;
-    std::optional<UpstreamConfig>  upstream_config_;
-    TcpSocket                      upstream_socket_;
-    std::mutex                     upstream_send_mutex_;
-    std::jthread                   upstream_thread_;
-    std::atomic<int>               next_index_{0};
-    std::mutex                     connections_mutex_;
-    std::vector<Entry>             connections_;
-    mutable std::mutex             local_mutex_;
-    std::unordered_set<uint32_t>   local_mailboxes_;
+    ServerSocket                                    server_;
+    MailboxRegistry                                 registry_;
+    std::size_t                                     max_msg_size_;
+    uint16_t                                        port_;
+    std::vector<PeerConfig>                         peer_configs_;
+    std::optional<UpstreamConfig>                   upstream_config_;
+    TcpSocket                                       upstream_socket_;
+    std::mutex                                      upstream_send_mutex_;
+    std::jthread                                    upstream_thread_;
+    std::vector<SystemRouteConfig>                  system_route_configs_;
+    std::vector<std::unique_ptr<SystemConnection>>  system_connections_;
+    std::atomic<int>                                next_index_{0};
+    std::mutex                                      connections_mutex_;
+    std::vector<Entry>                              connections_;
+    mutable std::mutex                              local_mutex_;
+    std::unordered_set<uint32_t>                    local_mailboxes_;
 };
 
 // ============================================================================
@@ -573,8 +630,9 @@ namespace {
 int main(int argc, char* argv[]) {
     uint16_t    port         = corerat::router::TcpRouter::kDefaultPort;
     std::size_t max_msg_size = 256 * 1024;
-    std::vector<corerat::router::PeerConfig>    peers;
-    std::optional<corerat::router::UpstreamConfig> upstream_config;
+    std::vector<corerat::router::PeerConfig>         peers;
+    std::optional<corerat::router::UpstreamConfig>   upstream_config;
+    std::vector<corerat::router::SystemRouteConfig>  system_routes;
 
     auto parse_host_port = [](const std::string& s, uint16_t default_port)
         -> std::pair<std::string, uint16_t> {
@@ -601,10 +659,27 @@ int main(int argc, char* argv[]) {
                                                  corerat::router::TcpRouter::kDefaultPort);
             upstream_config = corerat::router::UpstreamConfig{std::move(host), uport};
         }
+        else if ((arg == "--system-route" || arg == "-s") && i + 1 < argc) {
+            // Format: SYSID@HOST[:PORT]
+            std::string sr{argv[++i]};
+            const auto at = sr.find('@');
+            if (at == std::string::npos) {
+                std::fprintf(stderr,
+                    "Invalid --system-route '%s': expected SYSID@HOST[:PORT]\n",
+                    sr.c_str());
+            } else {
+                const uint8_t sysid =
+                    static_cast<uint8_t>(std::stoul(sr.substr(0, at)));
+                auto [host, sport] = parse_host_port(
+                    sr.substr(at + 1), corerat::router::TcpRouter::kDefaultPort);
+                system_routes.push_back({sysid, std::move(host), sport});
+            }
+        }
         else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: corerat-router-tcp [--port PORT] "
                         "[--max-msg-size BYTES] [--peer HOST[:PORT]] ..."
-                        " [--upstream HOST[:PORT]]\n");
+                        " [--upstream HOST[:PORT]]"
+                        " [--system-route SYSID@HOST[:PORT]] ...\n");
             return 0;
         }
     }
@@ -612,7 +687,8 @@ int main(int argc, char* argv[]) {
     ::signal(SIGPIPE, SIG_IGN);
 
     corerat::router::TcpRouter router{port, max_msg_size,
-                                      std::move(peers), std::move(upstream_config)};
+                                      std::move(peers), std::move(upstream_config),
+                                      std::move(system_routes)};
     if (!router.is_ready()) {
         std::fprintf(stderr, "Failed to bind port %u\n", static_cast<unsigned>(port));
         return 1;
