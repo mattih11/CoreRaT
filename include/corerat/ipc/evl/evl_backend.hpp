@@ -39,7 +39,7 @@
 #include <span>
 #include <string_view>
 #include <unistd.h>
-#include <sys/mman.h>
+#include <sys/mman.h>   // mmap, munmap, mlockall
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -193,6 +193,12 @@ public:
     TimsResult initialize() {
         if (created_) return TimsResult::SUCCESS;
 
+        // Lock all current and future pages into RAM.
+        // Required for OOB-safe memcpy into SHM: prevents page faults that
+        // would demote the EVL thread to in-band during the hot path.
+        // Must be called before evl_attach_self() on the first EVL thread.
+        ::mlockall(MCL_CURRENT | MCL_FUTURE);
+
         // Network mode: OOB UDP socket, no ring buffer needed
         if (mode_ == Mode::Network) {
             if (!create_oob_socket()) return TimsResult::ERROR_INIT;
@@ -208,6 +214,16 @@ public:
 
         if (mode_ == Mode::Local)
             evl_detail::registry_slot(config_.mailbox_id) = this;
+
+        // Public mode: create a PUBLIC xbuf so corerat-router-evl can bridge
+        // in-band (STD) senders to this OOB mailbox without touching the EVL
+        // ring directly (evl_lock_mutex/signal_event are forbidden for
+        // non-EVL threads).  The router opens /dev/evl/xbuf/corerat-xbuf-<id>
+        // at registration time and writes into it via plain write(2).
+        // oob_read(xbuf_fd_) is OOB-safe and is polled alongside ring_event_.
+        if (mode_ == Mode::Public) {
+            if (!create_xbuf()) return TimsResult::ERROR_INIT;
+        }
 
         created_ = true;
         return TimsResult::SUCCESS;
@@ -228,6 +244,10 @@ public:
         if (mode_ == Mode::Local &&
             evl_detail::registry_slot(config_.mailbox_id) == this)
             evl_detail::registry_slot(config_.mailbox_id) = nullptr;
+
+        if (xbuf_fd_ >= 0) { ::close(xbuf_fd_); xbuf_fd_ = -1; }
+        if (poll_fd_ >= 0) { ::close(poll_fd_); poll_fd_ = -1; }
+        poll_setup_done_ = false;
 
         destroy_evl_objects();
         free_ring();
@@ -411,6 +431,7 @@ private:
             evl_close_mutex(&ring_mutex_);
             return false;
         }
+        ring_event_fd_ = er;  // save raw fd for evl_add_pollfd in receive_impl()
         _EVL_LOG("[corerat] evl_create_event OK\n");
 #undef _EVL_LOG
 #endif
@@ -421,6 +442,50 @@ private:
 #ifdef CORERAT_PLATFORM_EVL
         evl_close_event(&ring_event_);
         evl_close_mutex(&ring_mutex_);
+#endif
+    }
+
+    // ========================================================================
+    // create_xbuf() — PUBLIC mode only, called from initialize() (in-band)
+    //
+    // Creates an EVL_CLONE_PUBLIC cross-buffer visible at:
+    //   /dev/evl/xbuf/corerat-xbuf-<mailbox_id>
+    //
+    // The router opens this path at registration time (plain open(2), no EVL).
+    // Inbound ring  (write(2) from router  → oob_read() by EVL thread).
+    // Outbound ring (oob_write() by EVL thread → read(2) by router).
+    // Buffer size = max_msg_size * message_slots (same as ring capacity).
+    // ========================================================================
+
+    bool create_xbuf() noexcept {
+#ifdef CORERAT_PLATFORM_EVL
+        const std::size_t buf_sz =
+            static_cast<std::size_t>(config_.max_msg_size) * capacity_;
+
+        char name_buf[64];
+        evl_detail::evl_name(name_buf, "corerat-xbuf-", config_.mailbox_id);
+
+        xbuf_fd_ = evl_create_xbuf(buf_sz, buf_sz,
+                                    EVL_CLONE_PUBLIC,
+                                    "%s", name_buf);
+        if (xbuf_fd_ < 0) {
+            char ebuf[80];
+            const int n = std::snprintf(ebuf, sizeof(ebuf),
+                "[corerat] evl_create_xbuf failed: %d\n", xbuf_fd_);
+            ::write(STDERR_FILENO, ebuf, static_cast<std::size_t>(n));
+            return false;
+        }
+
+        // Create the evl_poll group (in-band, ▼) so the first OOB call to
+        // receive_impl() can add fds via evl_add_pollfd() (▲ OOB).
+        poll_fd_ = evl_new_poll();
+        if (poll_fd_ < 0) {
+            ::close(xbuf_fd_); xbuf_fd_ = -1;
+            return false;
+        }
+        return true;
+#else
+        return true;  // no-op on STD platform
 #endif
     }
 
@@ -804,8 +869,20 @@ private:
             } else {
                 // Cross-process: open remote SHM + EVL handles by deterministic name
                 RemoteHandle* rh = get_or_open_remote(dest);
-                if (!rh) return TimsResult::ERROR_SEND;
-                ok = post_to_remote(*rh, data, size, priority);
+                if (rh) {
+                    ok = post_to_remote(*rh, data, size, priority);
+                } else {
+                    // Remote handle not available (dest is STD or on remote host).
+                    // Route via the local EVL router's outbound xbuf ring so the
+                    // router can forward over TCP (Scenario C: EVL→STD).
+                    // oob_write is ▲ OOB-safe — sender never demotes.
+#ifdef CORERAT_PLATFORM_EVL
+                    if (xbuf_fd_ >= 0) {
+                        const ssize_t w = oob_write(xbuf_fd_, data, size);
+                        ok = (w == static_cast<ssize_t>(size));
+                    }
+#endif
+                }
             }
         } else {
             // LOCAL: process-local registry only
@@ -822,6 +899,11 @@ private:
 
     // ========================================================================
     // receive_impl()
+    //
+    // Public mode with xbuf: polls two sources simultaneously via evl_poll:
+    //   - ring_event_ (EVL→EVL same-host SHM path, Scenario A)
+    //   - xbuf_fd_    (STD→EVL bridge path via router write(2), Scenario D)
+    // The poll group is set up on first call (evl_add_pollfd is ▲ OOB).
     // ========================================================================
 
     ssize_t receive_impl(std::span<std::byte> buffer,
@@ -833,6 +915,72 @@ private:
 
 #ifdef CORERAT_PLATFORM_EVL
         evl_detail::attach_this_thread();
+
+        // ── Set up poll group on first OOB entry ──────────────────────────
+        if (mode_ == Mode::Public && xbuf_fd_ >= 0 && !poll_setup_done_) {
+            // ring_event_ fd: monitor the EVL event for ring activity.
+            // EVL event fds are exposed via the /dev/evl hierarchy; we need
+            // the raw fd that evl_poll can monitor.  evl_add_pollfd takes the
+            // fd returned by evl_create_event (stored as ring_event_fd_).
+            evl_add_pollfd(poll_fd_, ring_event_fd_, POLLIN, evl_intval(0));
+            // xbuf inbound ring: written by router via write(2) from in-band.
+            evl_add_pollfd(poll_fd_, xbuf_fd_,       POLLIN, evl_intval(0));
+            poll_setup_done_ = true;
+        }
+
+        // ── Compute absolute deadline ─────────────────────────────────────
+        struct timespec abs_ts{};
+        const struct timespec* abs_ts_ptr = nullptr;
+        if (!timeout.is_negative()) {
+            struct timespec now{};
+            evl_read_clock(EVL_CLOCK_MONOTONIC, &now);
+            const int64_t deadline =
+                static_cast<int64_t>(now.tv_sec)  * 1'000'000'000LL
+              + static_cast<int64_t>(now.tv_nsec)
+              + timeout.count_ns();
+            abs_ts = {
+                static_cast<time_t>(deadline / 1'000'000'000LL),
+                static_cast<long>  (deadline % 1'000'000'000LL)
+            };
+            abs_ts_ptr = &abs_ts;
+        }
+
+        // ── Dual-source poll (Public mode with xbuf) ──────────────────────
+        if (mode_ == Mode::Public && poll_fd_ >= 0 && poll_setup_done_) {
+            std::array<struct evl_poll_event, 2> events{};
+            const int n = abs_ts_ptr
+                ? evl_timedpoll(poll_fd_, events.data(), 2, abs_ts_ptr)
+                : evl_poll     (poll_fd_, events.data(), 2);
+
+            if (n <= 0) return (n == 0 || n == -ETIMEDOUT) ? -ETIMEDOUT : n;
+
+            for (int i = 0; i < n; ++i) {
+                if (events[i].fd == static_cast<__u32>(xbuf_fd_)) {
+                    // Data from router bridge (in-band → OOB path)
+                    const ssize_t r = oob_read(xbuf_fd_,
+                                               buffer.data(), buffer.size());
+                    if (r <= 0) continue;
+                    if (meta && static_cast<std::size_t>(r) >= sizeof(WireHeader)) {
+                        WireHeader hdr{};
+                        std::memcpy(&hdr, buffer.data(), sizeof(WireHeader));
+                        meta->src      = hdr.src;
+                        meta->dest     = hdr.dest;
+                        meta->seq_nr   = hdr.seq_number;
+                        meta->priority = 0;
+                        meta->flags    = static_cast<uint8_t>(hdr.flags);
+                    }
+                    messages_received_.fetch_add(1, std::memory_order_relaxed);
+                    return r;
+                }
+                if (events[i].fd == static_cast<__u32>(ring_event_fd_)) {
+                    // Data from EVL ring (same-host OOB path) — fall through
+                    // to the ring read below.
+                    break;
+                }
+            }
+        }
+
+        // ── Ring read (Local and Public modes, same-host EVL path) ────────
         evl_lock_mutex(&ring_mutex_);
 
         // Standard condvar pattern: loop to guard against spurious wakeups.
@@ -845,19 +993,9 @@ private:
                     }
                 }
             } else {
-                struct timespec now{};
-                evl_read_clock(EVL_CLOCK_MONOTONIC, &now);
-                const int64_t deadline =
-                    static_cast<int64_t>(now.tv_sec)  * 1'000'000'000LL
-                  + static_cast<int64_t>(now.tv_nsec)
-                  + timeout.count_ns();
-                const struct timespec abs_ts{
-                    static_cast<time_t>(deadline / 1'000'000'000LL),
-                    static_cast<long>(deadline   % 1'000'000'000LL)
-                };
                 while (!has_in_use_slot()) {
                     const int r = evl_timedwait_event(
-                        &ring_event_, &ring_mutex_, &abs_ts);
+                        &ring_event_, &ring_mutex_, abs_ts_ptr);
                     if (r == -ETIMEDOUT) {
                         evl_unlock_mutex(&ring_mutex_);
                         return -ETIMEDOUT;
@@ -916,6 +1054,12 @@ private:
     struct evl_mutex ring_mutex_{};
     struct evl_event ring_event_{};
 #endif
+
+    // xbuf bridge (Public mode — OOB↔in-band via corerat-router-evl)
+    int  xbuf_fd_{-1};           // /dev/evl/xbuf/corerat-xbuf-<id> (PUBLIC only)
+    int  poll_fd_{-1};           // evl_poll group watching ring + xbuf
+    int  ring_event_fd_{-1};     // raw fd from evl_create_event (for evl_add_pollfd)
+    bool poll_setup_done_{false}; // true after first OOB evl_add_pollfd setup
 
     // Ring storage
     std::unique_ptr<SlotMeta[]> slot_meta_;   // LOCAL: heap meta array
