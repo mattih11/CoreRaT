@@ -127,14 +127,14 @@ EVL router routing decision:             TCP router routing decision:
 
 Only 6 combinations of (source type, destination type, location) are possible:
 
-| ID | Source | Destination | Location |
-|----|--------|-------------|----------|
-| A | EVL | EVL | Same host (different processes) |
-| B | EVL | EVL | Remote host |
-| C | EVL | STD | Always remote (host types differ → different hosts) |
-| D | STD | EVL | Always remote |
-| E | STD | STD | Same host (different processes) |
-| F | STD | STD | Remote host |
+| ID | Source | Destination | Location | Status |
+|----|--------|-------------|----------|--------|
+| A | EVL | EVL | Same host (different processes) | ✅ Implemented |
+| B | EVL | EVL | Remote host | ✅ Implemented |
+| C | EVL | STD | Always remote (host types differ → different hosts) | ⚠️ Partial — xbuf send path done; Gap 5 needed |
+| D | STD | EVL | Always remote | ⚠️ Partial — xbuf receive path done; Gap 5 needed |
+| E | STD | STD | Same host (different processes) | ✅ Implemented |
+| F | STD | STD | Remote host | ❌ Gap 1 + Gap 5 needed |
 
 EVL→STD same-host and STD→EVL same-host are **impossible** — a host runs either
 `corerat-router-evl` or `corerat-router-tcp`, never both.
@@ -208,7 +208,7 @@ sequenceDiagram
 | **Transport** | xbuf outbound ring → TCP → TCP | EVL router: `read(xbuf_fd)` → TCP to STD router → TCP to dest node |
 | **Receive** | STD receiver thread | `recv()` on TCP socket — existing `TimsMailbox::receive_raw()` |
 | **EVL demotion** | Sender only | ✅ `oob_write` is OOB-safe. STD receiver is in-band by nature. |
-| **Implemented** | ❌ No — requires Gap 2 (xbuf) + Gap 5 (peer routing) + Gap 6 (EVL router rewrite) | |
+| **Implemented** | ⚠️ Partial (`fbe23e1`) — EVL send via `oob_write(xbuf_fd_)` + EVL router xbuf→TCP path done; inter-router TCP peering (Gap 5) still needed for cross-host delivery | |
 
 ### Scenario D — STD → EVL, remote host
 
@@ -234,7 +234,7 @@ sequenceDiagram
 | **Transport** | TCP → TCP → xbuf inbound ring | EVL router does a plain `write(xbuf_fd)` — no EVL attachment needed in the router thread |
 | **Receive** | EVL receiver thread | `oob_read(xbuf_fd)` — OOB-safe |
 | **EVL demotion** | Receiver only | ✅ `oob_read` is OOB-safe |
-| **Implemented** | ❌ No — requires Gap 2 (xbuf in EVL router) + Gap 5 (peer routing) + Gap 6 (EVL router rewrite) | |
+| **Implemented** | ⚠️ Partial (`fbe23e1`) — STD send via TCP + EVL router `write(xbuf_fd)` + EVL `oob_read(xbuf_fd_)` done; inter-router TCP peering (Gap 5) still needed for cross-host delivery | |
 
 ### Scenario E — STD → STD, same host
 
@@ -450,8 +450,8 @@ POSIX SHM + EVL sync is the intended pattern, not a workaround.
 |----------|--------|---------------|
 | A | ✅ Implemented | — |
 | B | ✅ Implemented | — |
-| C | ❌ Not implemented | Gap 2 (xbuf), Gap 5 (peer routing), Gap 6 (EVL router rewrite) |
-| D | ❌ Not implemented | Gap 2, Gap 5, Gap 6 |
+| C | ⚠️ Partial (`fbe23e1`) | Gap 5 (inter-router peering for cross-host delivery) |
+| D | ⚠️ Partial (`fbe23e1`) | Gap 5 (inter-router peering for cross-host delivery) |
 | E | ✅ Implemented | — |
 | F | ❌ Not implemented | Gap 1, Gap 5 (inter-router peering) |
 
@@ -537,7 +537,7 @@ which is always true by definition for path ③).
 
 **Severity**: Critical  
 **Affects**: Any system running both EVL and STD nodes  
-**Status**: Design agreed (xbuf bridge in `corerat-router-evl`), implementation pending
+**Status**: ✅ Partially implemented (commit `fbe23e1`) — same-host xbuf bridge complete; inter-router TCP peering (Gap 5) still needed for full cross-host Scenario C/D routing
 
 ### RACK behaviour
 TiMS was a kernel module (Xenomai 2/3). It could reach RT threads from non-RT code via
@@ -609,11 +609,11 @@ switch (entry.kind) {
 entry pointing to the EVL router on remote EVL hosts (inter-router forwarding, Gap 5).
 
 ### Action items
-- [ ] Implement xbuf creation in `EvlMailbox::initialize()`.
-- [ ] Implement dual-source poll in `EvlMailbox::receive_raw_bytes()` (ring_event + xbuf).
-- [ ] Implement outbound xbuf path in `EvlMailbox::send()` for non-EVL destinations (route via router's outbound xbuf ring).
-- [ ] Upgrade `corerat-router-evl` from name-service to full message router (TCP accept loop, `Kind::Xbuf` registry, bridge-read thread, routing dispatch).
-- [ ] Add inter-router TCP peering to both routers (prerequisite for paths ④ ⑦).
+- [x] Implement xbuf creation in `EvlMailbox::initialize()` (`mlockall` + `create_xbuf()` helper, commit `fbe23e1`).
+- [x] Implement dual-source poll in `EvlMailbox::receive_raw_bytes()` (ring_event + xbuf via `evl_timedpoll` on `poll_fd_`, commit `fbe23e1`).
+- [x] Implement outbound xbuf path in `EvlMailbox::send()` for non-EVL destinations (`oob_write(xbuf_fd_)` fallthrough in `send_raw()`, commit `fbe23e1`).
+- [x] Upgrade `corerat-router-evl` from name-service to full message router (TCP accept loop, `Kind::Xbuf` registry, `XbufEntry` bridge-read thread, routing dispatch — commit `fbe23e1`).
+- [ ] Add inter-router TCP peering to both routers (prerequisite for cross-host Scenarios C/D/F — see Gap 5).
 
 ---
 
@@ -699,7 +699,7 @@ only exists between client and router.
 
 **Severity**: High (prerequisite for Gap 2)  
 **Affects**: EVL cross-process routing and xbuf bridge  
-**Status**: Design agreed; requires significant implementation work
+**Status**: ✅ Implemented (commit `fbe23e1`)
 
 ### Current state
 `corerat-router-evl` is a name-service (Unix domain socket): it maps `mailbox_id →
@@ -725,11 +725,10 @@ requires that libevl is linked.
 
 ### Action items
 - [x] Document that the current `corerat-router-evl` is a name-service only.
-- [ ] Rewrite `corerat-router-evl` as a TCP message router (reuse the `Connection` /
-      `MailboxRegistry` / `TcpRouter` structure from `corerat-router-tcp`).
-- [ ] Add xbuf open logic at registration time.
-- [ ] Add bridge-read thread per registered mailbox.
-- [ ] Retire the old Unix domain socket name-service protocol.
+- [x] Rewrite `corerat-router-evl` as a TCP message router (reuses `Connection` / `MailboxRegistry` pattern from `corerat-router-tcp`, commit `fbe23e1`).
+- [x] Add xbuf open logic at registration time (probes `/dev/evl/xbuf/corerat-xbuf-<id>` via `open(O_RDWR)` during `MSG_ROUTER_MBX_INIT_WITH_REPLY` handling, commit `fbe23e1`).
+- [x] Add bridge-read thread per registered mailbox (`XbufEntry` owns a `std::jthread` that `poll`/`read`s the xbuf outbound ring, commit `fbe23e1`).
+- [x] Retire the old Unix domain socket name-service protocol (replaced entirely by TiMS TCP on port 2000, commit `fbe23e1`).
 
 ---
 
