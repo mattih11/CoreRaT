@@ -12,9 +12,7 @@
 
 **CoreRaT does NOT depend on CommRaT.** CommRaT depends on CoreRaT.
 
-**Current Status**: Phases 1 (platform), 2 (IPC TiMS backend) complete. Phase 3 (EVL IPC backend) in progress.
-
-**Next**: `EvlMailbox` implementation (`include/corerat/ipc/evl/evl_backend.hpp`).
+**Current Status**: All three phases complete. Phase 3 (EVL IPC backend) shipped.
 
 ## Architecture
 
@@ -32,20 +30,21 @@ include/corerat/
       threading_impl.hpp   # EVL backend (pthread + evl_attach_self, evl_mutex, evl_event)
       timestamp_impl.hpp   # evl_read_clock, evl_usleep, evl_sleep_until
   messaging/
-    message_id.hpp         # MessagePrefix, UserSubPrefix, make_message_id
-    message_def.hpp        # MessageDefinition<Payload, Prefix, SubPrefix, ID, Reply>
+    message_id.hpp         # MessagePrefix, UserSubPrefix/SystemSubPrefix, make_message_id,
+                           # MessageDefinition<Payload, Prefix, SubPrefix, ID, Reply>
     message_registry.hpp   # MessageRegistry<...> — compile-time dispatch
     registry_utils.hpp     # Compile-time registry filters and lookup helpers
-    wire_header.hpp        # WireHeader — on-wire struct (RACK-compatible)
-    wire_message.hpp       # WireMessage<T> = {WireHeader header; T payload;}
+    wire_message.hpp       # WireHeader + WireMessage<T> = {WireHeader header; T payload;}
   ipc/
-    ipc.hpp                # IPC backend selection
     mailbox_config.hpp     # MailboxConfig, MailboxResult<T>, MailboxError
-    mailbox.hpp            # Mailbox<Registry> — type-safe frontend
+    mailbox.hpp            # Mailbox<MessageDefs...> — type-safe frontend;
+                           # selects IpcMailbox backend via CORERAT_IPC_EVL macro
     tims/
+      tcp_socket.hpp       # TcpSocket — POSIX TCP socket wrapper
+      protocol.hpp         # TiMS router wire protocol helpers
       tims_backend.hpp     # TimsMailbox — RACK-compatible TCP backend
     evl/
-      evl_backend.hpp      # EvlMailbox — EVL ring-buffer backend (Phase 3)
+      evl_backend.hpp      # EvlMailbox — EVL ring-buffer + OOB UDP backend (header-only)
 src/
   tims_backend.cpp         # TimsMailbox implementation
   router/
@@ -65,7 +64,7 @@ test/
   test_registry_utils.cpp
   test_router_tcp.cpp
   test_wire_message_sizing.cpp
-  ping_pong/               # End-to-end EVL IPC test
+  ping_pong/               # End-to-end EVL IPC test (ping_node, pong_node, evl_pingpong)
 ```
 
 **External dependencies** (installed system-wide):
@@ -149,13 +148,13 @@ Selected via `CORERAT_IPC` (AUTO = follows platform):
 
 Thin wrapper over POSIX TCP sockets. Connects to `corerat-router-tcp` on `localhost:2000`. Wire protocol identical to RACK — existing RACK nodes and CommRaT nodes connect without modification.
 
-**Problem**: `tims_recvmsg_timed()` is a blocking POSIX socket call. When called from an EVL thread, it demotes the thread from OOB to in-band, losing all real-time guarantees. This is why the EVL IPC backend (Phase 3) is needed.
+**Problem**: `receive_raw_bytes()` uses POSIX `poll()`/`recv()` — in-band syscalls that demote EVL threads from OOB to in-band, losing all real-time guarantees. This is why the EVL IPC backend (Phase 3) is needed.
 
-### EVL IPC Backend (Phase 3, in progress)
+### EVL IPC Backend (Phase 3, complete)
 
 **Goal**: A receive path that stays entirely in OOB context.
 
-**Design**: Lock-free ring buffer per mailbox, backed by `evl_mutex` + `evl_event`:
+**Design**: Per-mailbox ring buffer (heap for Local, POSIX SHM for Public) protected by `evl_mutex` + `evl_event`. Network mode uses OOB UDP sockets instead of a ring buffer. The entire backend is **header-only** — no compiled TU.
 
 ```cpp
 // include/corerat/ipc/evl/evl_backend.hpp
@@ -163,47 +162,65 @@ class EvlMailbox {
 public:
     enum class Mode {
         Local,    // Same-process heap ring (fastest, no SHM)
-        Public,   // Cross-process POSIX SHM ring (evl_mutex on SHM)
-        Network   // OOB UDP/IPv4, cross-machine RT
+        Public,   // Cross-process POSIX SHM ring (evl_mutex/event with EVL_CLONE_PUBLIC)
+        Network   // OOB UDP/IPv4, cross-machine RT (oob_sendmsg / oob_recvmsg)
     };
 
-    EvlMailbox(uint32_t mailbox_id, size_t slots, size_t max_msg_size, Mode mode);
-    ~EvlMailbox();
+    explicit EvlMailbox(const TimsConfig& config,
+                        Mode mode = Mode::Local,
+                        const EvlNetworkConfig& net_config = {});
 
-    bool    create();
-    void    destroy();
-    bool    send(uint32_t dest_id, std::span<const std::byte> payload);
-    ssize_t receive(std::span<std::byte> buffer, int64_t timeout_ns);
-    bool    peek();
+    TimsResult initialize();
+    void       shutdown();
 
-private:
-    // Ring buffer: producer writes to head, consumer reads from tail
-    // Protected by evl_mutex (OOB-safe)
-    struct alignas(64) Slot {
-        std::atomic<uint32_t> seq;
-        uint32_t              size;
-        std::array<std::byte, kMaxMessageSize> data;
-    };
-    // ...
+    template<typename T>
+    TimsResult send(T& message, uint32_t dest_mailbox_id);
+
+    ssize_t receive_raw_bytes(std::span<std::byte> buffer,
+                              Duration timeout, Metadata* metadata = nullptr);
+};
+
+// Network routing — system_id-based, matching RACK/TiMS convention
+struct EvlNetworkConfig {
+    static constexpr uint16_t kOobBasePort = 42000;
+    // port_for(mailbox_id) = kOobBasePort + (mailbox_id & 0x7FFF)
+    // system_id = (mailbox_id >> 24) & 0xFF
+    uint8_t local_system_id{0};
+    struct Route { uint8_t system_id; char ip[16]; };
+    std::array<Route, 8> routes{};
+    uint8_t route_count{0};
+};
+
+// SHM layout header (PUBLIC mode) — stored at offset 0 of the SHM region
+struct ShmLayout {
+    uint32_t capacity;
+    uint32_t slot_size;
+    uint32_t _pad[2];    // pad to 16 bytes
 };
 ```
 
 **Key EVL API calls for EvlMailbox**:
 ```cpp
-evl_new_mutex(&ring_mutex_, "corerat-mbx-%u", mailbox_id_);
-evl_new_event(&ring_event_,  "corerat-evt-%u", mailbox_id_);
+// Ring buffer modes (Local / Public):
+evl_create_mutex(&ring_mutex_, EVL_CLOCK_MONOTONIC, 0, flags, "%s", name);
+evl_create_event(&ring_event_, EVL_CLOCK_MONOTONIC, eflags, "%s", name);
 
 // Send (OOB-safe):
 evl_lock_mutex(&ring_mutex_);
 // write to ring slot
+evl_signal_event(&ring_event_);   // signal before unlock for OOB wake-up
 evl_unlock_mutex(&ring_mutex_);
-evl_signal_event(&ring_event_);
 
 // Receive (blocking, OOB-safe):
-evl_lock_mutex(&ring_mutex_);
 evl_timedwait_event(&ring_event_, &ring_mutex_, &abs_ts);
 // read from ring slot
 evl_unlock_mutex(&ring_mutex_);
+
+// Network mode:
+socket(AF_INET, SOCK_DGRAM | SOCK_OOB, 0)   // OOB UDP socket
+evl_net_solicit(...)                          // prime ARP/route cache at init
+oob_sendmsg(...)                             // OOB send
+oob_recvmsg(...)                             // OOB receive
 ```
 
 Full EVL API reference: `CommRaT/docs/work/EVL_API_REFERENCE.md` (via symlink).
@@ -214,6 +231,7 @@ Full EVL API reference: `CommRaT/docs/work/EVL_API_REFERENCE.md` (via symlink).
 
 ```cpp
 // On-wire header — matches RACK tims_msg_head layout exactly
+// Defined in wire_message.hpp (alongside WireMessage<T>)
 struct WireHeader {
     uint32_t msg_type;    // MessageDefinition::full_id()
     uint32_t msg_size;    // total serialized bytes (header + payload)
@@ -234,20 +252,36 @@ struct WireMessage {
 
 ### MessageDefinition
 
+Defined in `message_id.hpp`. All fields are `static constexpr`.
+
 ```cpp
 template<
-    typename Payload,
-    MessagePrefix Prefix,
-    auto SubPrefix,
-    uint16_t LocalID,
-    typename ReplyPayload = void>
+    typename PayloadT,
+    MessagePrefix Prefix_ = MessagePrefix::UserDefined,
+    auto SubPrefix_        = UserSubPrefix::Data,
+    uint16_t ID_           = 0,   // 0 = auto-assigned by MessageRegistry
+    typename ReplyT        = void>
 struct MessageDefinition {
-    using payload_type = Payload;
-    static constexpr uint32_t full_id();       // Prefix | SubPrefix | local_id
-    static constexpr bool has_reply;
-    static constexpr bool is_request;
-    using ReplyMessageDef = /* auto-generated */;
+    using Payload        = PayloadT;
+    using ReplyPayload   = ReplyT;
+    using ReplyMessageDef = /* auto-derived — ID flipped to negative */;
+
+    static constexpr MessagePrefix prefix    = Prefix_;
+    static constexpr uint8_t       subprefix = /* from SubPrefix_ */;
+    static constexpr uint16_t      local_id  = ID_;
+    static constexpr uint32_t      full_id();    // Prefix | SubPrefix | local_id
+    static constexpr bool          is_request;   // ReplyT != void
+    static constexpr bool          is_reply;     // negative ID (auto-derived reply)
+    static constexpr bool          has_reply;    // is_request alias
+    static constexpr bool          needs_auto_id; // ID_ == 0
 };
+
+// Convenience wrappers in namespace Message::
+namespace Message {
+    template<typename T> using Data    = MessageDefinition<T, MessagePrefix::UserDefined, UserSubPrefix::Data>;
+    template<typename T> using Command = MessageDefinition<T, MessagePrefix::UserDefined, UserSubPrefix::Commands>;
+    template<typename T> using Event   = MessageDefinition<T, MessagePrefix::UserDefined, UserSubPrefix::Events>;
+}
 ```
 
 ### MessageRegistry
@@ -272,23 +306,62 @@ struct MessageRegistry {
 
 ```cpp
 // Type-safe frontend — all message types checked at compile time
-template<typename Registry>
+// Takes MessageDefinition types directly; builds MessageRegistry internally
+template<typename... MessageDefs>
 class Mailbox {
 public:
     explicit Mailbox(const MailboxConfig& config);
     ~Mailbox();
 
-    MailboxResult<void> initialize();
-    void                shutdown();
+    MailboxResult<void> start();   // initialize backend, mark running
+    void                stop();    // shutdown backend
 
-    // Send — compile-time type check
+    bool is_running() const;
+
+    // Send — compile-time type check; takes WireMessage<T>& directly
     template<typename T>
-        requires Registry::template contains<T>
-    MailboxResult<void> send(const T& payload, uint32_t dest_mailbox_id);
+        requires is_registered<T>
+    MailboxResult<void> send(WireMessage<T>& message, uint32_t dest_mailbox_id);
 
-    // Blocking receive with visitor pattern
-    template<typename Handler>
-    MailboxResult<void> receive(Duration timeout, Handler&& handler);
+    // Send a reply — dest taken from request.header.src automatically
+    template<typename RequestPayload, typename ReplyPayload>
+    MailboxResult<void> send_reply(const WireMessage<RequestPayload>& request,
+                                   ReplyPayload& reply);
+
+    // Blocking receive with visitor (1 s default timeout)
+    template<typename Visitor>
+    MailboxResult<void> receive_any(Visitor&& visitor);
+
+    // Blocking receive with explicit timeout and visitor
+    template<typename Visitor>
+    MailboxResult<void> receive_any_for(Duration timeout, Visitor&& visitor);
+
+    // Typed receive into a pre-allocated WireMessage<T> (zero-copy)
+    template<typename T>
+        requires is_registered<T>
+    bool receive(WireMessage<T>& message, Duration timeout = Seconds(1));
+};
+```
+
+### MailboxConfig
+
+```cpp
+struct MailboxConfig {
+    uint32_t mailbox_id;
+    size_t   message_slots    = 10;
+    size_t   max_message_size = 4096;
+    uint8_t  send_priority    = 10;
+    bool     realtime         = false;
+
+    // EVL only — ignored on STD/TIMS
+    bool     cross_process    = false;   // Mode::Public (cross-process SHM ring)
+    bool     network          = false;   // Mode::Network (OOB UDP, cross-machine)
+    uint8_t  local_system_id  = 0;      // must match mailbox_id[31:24]
+
+    struct NetworkRoute { uint8_t system_id; char ip[16]; };
+    static constexpr uint8_t kMaxNetworkRoutes = 8;
+    std::array<NetworkRoute, kMaxNetworkRoutes> network_routes{};
+    uint8_t  network_route_count{0};
 };
 ```
 
@@ -325,10 +398,13 @@ CMake options:
 - `CORERAT_PLATFORM` — `STD` or `EVL`
 - `CORERAT_IPC` — `TIMS`, `EVL`, or `AUTO`
 - `CORERAT_BUILD_TESTS` — `ON`/`OFF`
+- `CORERAT_BUILD_ROUTERS` — `ON`/`OFF`
 
 Install targets:
 - `CoreRaT::corerat` — header-only core (platform + messaging)
-- `CoreRaT::corerat_tims` — + TiMS IPC backend (links `tims_backend.cpp`)
+- `CoreRaT::corerat_tims` — + TiMS IPC backend (links `tims_backend.cpp`; only when `CORERAT_IPC=TIMS`)
+
+The STD-platform preset also produces a `corerat-std_<version>_amd64.deb` package via CPack.
 
 ## EVL Development Workflow
 
@@ -378,7 +454,7 @@ No emojis anywhere — not in source, headers, docs, or cout output.
 |---|---|---|
 | 1 | done | Platform layer (Thread, Mutex, CondVar, Time) — STD + EVL backends |
 | 2 | done | Messaging layer (WireHeader, WireMessage, MessageRegistry) + TiMS IPC backend |
-| 3 | in progress | EVL IPC backend (EvlMailbox — ring buffer + evl_mutex + evl_event) |
+| 3 | done | EVL IPC backend (EvlMailbox — ring buffer + evl_mutex + evl_event) |
 
 ## What CoreRaT Does NOT Own
 
