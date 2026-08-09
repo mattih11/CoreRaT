@@ -28,6 +28,12 @@ inline constexpr int8_t MSG_ROUTER_MBX_DELETE          = 14;
 inline constexpr int8_t MSG_ROUTER_GET_STATUS          = 17;
 inline constexpr int8_t MSG_ROUTER_DISABLE_WATCHDOG    = 19;
 
+// Inter-router peer protocol (Gap 5)
+// Sent only between router daemons, never by client nodes.
+inline constexpr int8_t MSG_ROUTER_PEER_HELLO    = 20;  ///< Identify as peer router; no payload
+inline constexpr int8_t MSG_ROUTER_PEER_REGISTER = 21;  ///< Advertise local mailbox; payload: MbxInitPayload
+inline constexpr int8_t MSG_ROUTER_PEER_DELETE   = 22;  ///< De-advertise local mailbox; payload: MbxInitPayload
+
 // ============================================================================
 // Frame header — identical layout to tims_msg_head (16 bytes, packed)
 // ============================================================================
