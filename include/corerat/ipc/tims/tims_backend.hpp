@@ -19,10 +19,13 @@ namespace corerat {
 
 struct TimsConfig {
     sertial::fixed_string<32> mailbox_name;
-    uint32_t mailbox_id   = 0;
-    std::size_t max_msg_size = 4096;
-    uint32_t priority     = 0;
-    bool     realtime     = false;
+    uint32_t mailbox_id       = 0;
+    std::size_t max_msg_size  = 4096;
+    uint32_t priority         = 0;
+    bool     realtime         = false;
+    /// Forwarded from MailboxConfig::max_remote_handles — used by EvlMailbox.
+    /// Ignored by TimsMailbox.
+    uint32_t max_remote_handles = 16;
 
     TimsConfig() : mailbox_name("default") {}
 };

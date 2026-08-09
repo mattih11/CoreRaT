@@ -278,10 +278,11 @@ public:
 private:
     static TimsConfig create_backend_config(const MailboxConfig& config) {
         TimsConfig tc;
-        tc.mailbox_id   = config.mailbox_id;
-        tc.max_msg_size = config.max_message_size;
-        tc.priority     = config.send_priority;
-        tc.realtime     = config.realtime;
+        tc.mailbox_id          = config.mailbox_id;
+        tc.max_msg_size        = config.max_message_size;
+        tc.priority            = config.send_priority;
+        tc.realtime            = config.realtime;
+        tc.max_remote_handles  = config.max_remote_handles;
 
         // Build name "mailbox_<id>" without heap allocation
         tc.mailbox_name = sertial::fixed_string<32>("mailbox_");

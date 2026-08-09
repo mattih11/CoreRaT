@@ -31,6 +31,7 @@
 #include "corerat/platform/duration.hpp"
 #include <array>
 #include <atomic>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -177,7 +178,10 @@ public:
     explicit EvlMailbox(const TimsConfig& config,
                         Mode mode = Mode::Local,
                         const EvlNetworkConfig& net_config = {})
-        : config_(config), mode_(mode), net_config_(net_config) {}
+        : config_(config), mode_(mode), net_config_(net_config) {
+        remote_handles_.resize(
+            config_.max_remote_handles > 0 ? config_.max_remote_handles : 16u);
+    }
 
     ~EvlMailbox() { shutdown(); }
 
@@ -724,21 +728,61 @@ private:
         std::size_t shm_size{0};
         int         shm_fd{-1};
         bool        valid{false};
+        uint64_t    last_used{0};        // LRU counter — updated on every hit
 #ifdef CORERAT_PLATFORM_EVL
         struct evl_mutex mutex{};
         struct evl_event event{};
 #endif
     };
 
-    static constexpr uint32_t kMaxRemoteHandles = 16;
-    std::array<RemoteHandle, kMaxRemoteHandles> remote_handles_{};
+    std::vector<RemoteHandle> remote_handles_;  // capacity = config_.max_remote_handles
 
+    /// Close one remote handle and reset it to the empty state.
+    void close_remote(RemoteHandle& h) noexcept {
+        if (!h.valid) return;
+#ifdef CORERAT_PLATFORM_EVL
+        evl_close_event(&h.event);
+        evl_close_mutex(&h.mutex);
+#endif
+        ::munmap(h.shm_base, h.shm_size);
+        ::close(h.shm_fd);
+        h = RemoteHandle{};
+    }
+
+    /**
+     * @brief Return a cached handle for @p dest, opening one if necessary.
+     *
+     * Hit:       update LRU timestamp, return cached pointer.
+     * Miss:      open a new handle in the first empty slot.
+     * Cache full: evict the least recently used valid handle, open new one.
+     *
+     * Opening / closing a handle involves in-band syscalls (shm_open, mmap,
+     * evl_open_mutex/event) — these are uncommon slow-path operations.
+     */
     RemoteHandle* get_or_open_remote(uint32_t dest) noexcept {
+        // Cache hit
+        for (auto& h : remote_handles_) {
+            if (h.valid && h.dest_id == dest) {
+                h.last_used = ++lru_counter_;
+                return &h;
+            }
+        }
+        // Empty slot
+        for (auto& h : remote_handles_) {
+            if (!h.valid) {
+                if (!open_remote(h, dest)) return nullptr;
+                h.last_used = ++lru_counter_;
+                return &h;
+            }
+        }
+        // Cache full — evict least recently used
+        RemoteHandle* lru = &remote_handles_[0];
         for (auto& h : remote_handles_)
-            if (h.valid && h.dest_id == dest) return &h;
-        for (auto& h : remote_handles_)
-            if (!h.valid) { return open_remote(h, dest) ? &h : nullptr; }
-        return nullptr;  // cache full
+            if (h.last_used < lru->last_used) lru = &h;
+        close_remote(*lru);
+        if (!open_remote(*lru, dest)) return nullptr;
+        lru->last_used = ++lru_counter_;
+        return lru;
     }
 
     bool open_remote(RemoteHandle& h, uint32_t dest) noexcept {
@@ -782,16 +826,7 @@ private:
     }
 
     void close_all_remotes() noexcept {
-        for (auto& h : remote_handles_) {
-            if (!h.valid) continue;
-#ifdef CORERAT_PLATFORM_EVL
-            evl_close_event(&h.event);
-            evl_close_mutex(&h.mutex);
-#endif
-            ::munmap(h.shm_base, h.shm_size);
-            ::close(h.shm_fd);
-            h = RemoteHandle{};
-        }
+        for (auto& h : remote_handles_) close_remote(h);
     }
 
     /// Post directly into a remote process's ring buffer via its mapped SHM.
@@ -1049,6 +1084,7 @@ private:
     bool                  created_{false};
     std::atomic<uint64_t> messages_sent_{0};
     std::atomic<uint64_t> messages_received_{0};
+    uint64_t              lru_counter_{0};   // monotonic counter for LRU eviction
 
 #ifdef CORERAT_PLATFORM_EVL
     struct evl_mutex ring_mutex_{};

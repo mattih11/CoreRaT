@@ -738,27 +738,33 @@ requires that libevl is linked.
 ## Gap 7 — Remote Handle Cache Limit (EVL Public Mode)
 
 **Severity**: Low  
-**Affects**: EVL Public mode with many peer mailboxes
+**Affects**: EVL Public mode with many peer mailboxes  
+**Status**: ✅ Implemented — configurable LRU cache via `MailboxConfig::max_remote_handles`
 
 ### RACK behaviour
 No equivalent fixed limit; the TiMS router handled any number of registered mailboxes.
 Component-level receive only needed one connection to the router.
 
 ### CoreRaT current state
-`EvlMailbox` caches up to `kMaxRemoteHandles = 16` open remote SHM handles.
-If a single `EvlMailbox` instance needs to send to more than 16 distinct peer mailboxes,
-`get_or_open_remote()` returns `nullptr` and the send fails silently.
+`EvlMailbox` holds a `std::vector<RemoteHandle>` sized to `MailboxConfig::max_remote_handles`
+(default 16, configurable at construction time). Each handle caches an open `mmap` +
+`evl_mutex`/`evl_event` triplet for one peer mailbox. When the cache is full the least
+recently used handle is evicted (LRU counter per handle, incremented on every hit).
 
 ### Action items
-- [ ] Increase `kMaxRemoteHandles` or make it configurable via `MailboxConfig`.
-- [ ] Consider an LRU eviction policy for the remote handle cache.
+- [x] Make the remote handle cache size configurable via `MailboxConfig::max_remote_handles`
+      (propagated through `TimsConfig` → `EvlMailbox` constructor).
+- [x] Implement LRU eviction: `RemoteHandle::last_used` counter, evict min on cache full.
+      Eviction goes in-band (shm_open/mmap/evl_open_mutex) — acceptable since
+      it only occurs on the cache-miss + cache-full slow path.
 
 ---
 
 ## Gap 8 — No Cross-System (Multi-Robot) Address Space
 
 **Severity**: Low (single-robot deployments not affected)  
-**Affects**: Multi-robot systems, matching RACK's system_id routing
+**Affects**: Multi-robot systems, matching RACK's system_id routing  
+**Status**: ✅ Implemented — `--system-route SYSID@HOST[:PORT]` flag on both routers
 
 ### RACK behaviour
 The top 8 bits of the 32-bit mailbox address are `system_id`. Multiple robot systems
@@ -766,15 +772,16 @@ The top 8 bits of the 32-bit mailbox address are `system_id`. Multiple robot sys
 by system_id and forwards to the correct system router.
 
 ### CoreRaT current state
-`MailboxConfig::local_system_id` and `EvlNetworkConfig::Route::system_id` exist in EVL
-Network mode — so the field is preserved in the address and the routing logic extracts it.
-However, `corerat-router-tcp` ignores the system_id entirely; it does a flat `mailbox_id`
-lookup. There is no concept of forwarding to a different system based on system_id.
+Both `corerat-router-tcp` and `corerat-router-evl` extract `system_id = dest[31:24]`
+from the destination mailbox address and look it up in a per-system route table
+configured via `--system-route SYSID@HOST[:PORT]`. Per-system connections have their
+own TCP socket, send mutex, and reader thread. The generic `--upstream` connection
+serves as the fallback for unmatched system_ids.
 
 ### Action items
-- [ ] No immediate action needed for single-robot use.
-- [ ] Gap 1 `--upstream` provides the forwarding hook; system_id-based inter-system
-      routing (Gap 8) should build on top of it.
+- [x] Add `--system-route SYSID@HOST[:PORT]` / `-s` flag to both routers.
+- [x] Extract `system_id` from `dest >> 24` in `forward_to_upstream()` and route
+      to the matching per-system connection before falling back to `--upstream`.
 
 ---
 
@@ -815,8 +822,8 @@ because it is just a request/reply message exchange.
 | 4 | No byte-order conversion on receive | Low | ✅ Implemented — `sertial::swap_endianness_from` wired in `tims_backend.cpp` |
 | 5 | No router mailbox advertisement protocol | Medium | ✅ Implemented — `--peer` peering (`53f884f`) |
 | 6 | EVL router is name-service only, must become full router | **High** | ✅ Implemented — full xbuf-bridge EVL router (`fbe23e1`) |
-| 7 | Remote handle cache capped at 16 (EVL Public mode) | Low | Open |
-| 8 | No cross-system (system_id) routing in TCP router | Low | Open (design with Gap 1 follow-up) |
+| 7 | Remote handle cache capped at 16 (EVL Public mode) | Low | ✅ Implemented — configurable LRU cache (`max_remote_handles`) |
+| 8 | No cross-system (system_id) routing in TCP router | Low | ✅ Implemented — `--system-route SYSID@HOST[:PORT]` both routers |
 | 9 | No pub/sub at IPC layer (by design) | Low | ✅ Closed (CommRaT concern) |
 
 ---
