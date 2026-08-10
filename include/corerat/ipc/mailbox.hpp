@@ -184,6 +184,22 @@ public:
     // ========================================================================
 
     /**
+     * @brief Non-blocking receive — returns immediately if no message is available.
+     *
+     * Equivalent to receive(message, Milliseconds(0)).  Use this instead of
+     * calling receive() with a zero timeout directly; the name communicates
+     * intent and matches RACK's recvMsgIf() semantics.
+     *
+     * @tparam T Payload type — must be registered.
+     * @return true if a message was received, false if none was waiting.
+     */
+    template<typename T>
+        requires is_registered<T>
+    bool try_receive(WireMessage<T>& message) {
+        return receive(message, Milliseconds(0));
+    }
+
+    /**
      * @brief Receive into a pre-allocated WireMessage<T> (zero-copy).
      */
     template<typename T>
