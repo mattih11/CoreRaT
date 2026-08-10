@@ -91,7 +91,15 @@ inline std::string_view shm_name(char (&buf)[64], uint32_t id) noexcept {
 /// Attach the calling thread to the EVL scheduler if not already attached.
 /// Must be called before any OOB syscall (evl_lock_mutex, evl_wait_event …).
 /// -EBUSY = already attached on this thread, which is fine.
+///
+/// IMPORTANT: Guard with evl_is_inband() before calling gettid().
+/// gettid() is a kernel syscall (SYS_gettid).  If the calling thread is
+/// already in the EVL OOB stage (e.g. created by corerat::Thread which sets
+/// EVL_T_HMSIG), calling gettid() triggers an OOB→in-band demotion and EVL
+/// sends SIGXCPU (EVL_HMDIAG_SYSDEMOTE) to the thread.  evl_is_inband() reads
+/// a thread-local flag — no syscall, safe from OOB context.
 inline void attach_this_thread() noexcept {
+    if (!evl_is_inband()) return;  // already OOB-attached — gettid() would SYSDEMOTE
     const int r = evl_attach_thread(EVL_CLONE_PRIVATE,
                                     "corerat.%d",
                                     static_cast<int>(gettid()));
