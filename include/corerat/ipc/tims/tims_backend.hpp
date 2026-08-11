@@ -1,10 +1,10 @@
 #pragma once
 
+#include "corerat/ipc/ipc_types.hpp"  // TimsConfig (= IpcConfig), TimsResult (= IpcResult)
 #include "corerat/ipc/tims/tcp_socket.hpp"
 #include "corerat/messaging/wire_message.hpp"
 #include "corerat/platform/duration.hpp"
 #include "corerat/platform/timestamp.hpp"
-#include <sertial/containers/fixed_string.hpp>
 #include <atomic>
 #include <cstddef>
 #include <span>
@@ -12,33 +12,6 @@
 #include <optional>
 
 namespace corerat {
-
-// ============================================================================
-// TiMS backend configuration
-// ============================================================================
-
-struct TimsConfig {
-    sertial::fixed_string<32> mailbox_name;
-    uint32_t mailbox_id       = 0;
-    std::size_t max_msg_size  = 4096;
-    uint32_t priority         = 0;
-    bool     realtime         = false;
-    /// Forwarded from MailboxConfig::max_remote_handles — used by EvlMailbox.
-    /// Ignored by TimsMailbox.
-    uint32_t max_remote_handles = 16;
-
-    TimsConfig() : mailbox_name("default") {}
-};
-
-enum class TimsResult {
-    SUCCESS            =  0,
-    ERROR_INIT         = -1,
-    ERROR_SEND         = -2,
-    ERROR_RECEIVE      = -3,
-    ERROR_TIMEOUT      = -4,
-    ERROR_INVALID_MSG  = -5,
-    ERROR_NOT_INIT     = -6
-};
 
 // ============================================================================
 // TimsMailbox — TCP-socket IPC backend (CORERAT_IPC_TIMS)

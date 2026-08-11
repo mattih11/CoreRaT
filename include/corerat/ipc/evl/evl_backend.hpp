@@ -26,7 +26,7 @@
  *   receive: evl_timedwait/evl_wait → memcpy → mark free → evl_unlock
  */
 
-#include "corerat/ipc/tims/tims_backend.hpp"   // TimsConfig, TimsResult
+#include "corerat/ipc/ipc_types.hpp"  // IpcConfig (= TimsConfig), IpcResult (= TimsResult)
 #include "corerat/messaging/wire_message.hpp"
 #include "corerat/platform/duration.hpp"
 #include <array>
