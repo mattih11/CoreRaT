@@ -35,7 +35,6 @@
 #pragma once
 
 #include "corerat/logging/log_level.hpp"
-#include "corerat/logging/detail/rt_append.hpp"
 #include "corerat/logging/rt_log_entry.hpp"
 #include "corerat/logging/rt_logger_base.hpp"
 #include "corerat/logging/rt_log_stream.hpp"

@@ -33,6 +33,7 @@
 #include "corerat/logging/rt_logger_base.hpp"
 #include "corerat/logging/rt_log_stream.hpp"
 #include "corerat/logging/log_sink.hpp"
+#include <sertial/containers/rt_format.hpp>
 
 namespace corerat {
 
@@ -94,7 +95,7 @@ public:
         e.source_id  = source_id_;
         e.level      = lvl;
         e.message.clear();
-        detail::append_rt(e.message, msg, len);
+        sertial::rt::append(e.message, msg, len);
 
         ++head_;
         ring_cv_.notify_one();
@@ -229,7 +230,7 @@ private:
         out.timestamp  = e.timestamp;
         out.source_id  = e.source_id;
         out.level      = e.level;
-        detail::append_rt(out.message, e.message.c_str(), e.message.size());
+        sertial::rt::append(out.message, e.message.c_str(), e.message.size());
 
         for (std::size_t i = 0; i < sink_count_; ++i) {
             sinks_[i]->write(out);
