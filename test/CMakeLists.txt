@@ -21,6 +21,14 @@ corerat_test(test_message_id)
 corerat_test(test_registry_utils)
 corerat_test(test_wire_message_sizing)
 
+# RT logger test — requires corerat::Thread which calls evl_attach_self() on EVL.
+# Uses corerat_test() helper (links corerat INTERFACE which already carries EVL::evl
+# when CORERAT_PLATFORM=EVL).
+corerat_test(test_rt_logger)
+set_tests_properties(test_rt_logger PROPERTIES
+    TIMEOUT 30
+    LABELS  "unit;rt")
+
 # ============================================================================
 # Router smoke test + ping-pong integration test (only when routers are built)
 # ============================================================================
