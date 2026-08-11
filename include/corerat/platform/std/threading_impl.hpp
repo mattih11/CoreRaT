@@ -60,8 +60,20 @@ public:
 
     Thread(const Thread&) = delete;
     Thread& operator=(const Thread&) = delete;
-    Thread(Thread&&) = default;
-    Thread& operator=(Thread&&) = default;
+
+    // std::thread move already clears the source (leaves it non-joinable).
+    Thread(Thread&& other) noexcept
+        : config_(std::move(other.config_))
+        , thread_(std::move(other.thread_)) {}
+
+    Thread& operator=(Thread&& other) noexcept {
+        if (this != &other) {
+            if (thread_.joinable()) thread_.join();
+            config_ = std::move(other.config_);
+            thread_ = std::move(other.thread_);
+        }
+        return *this;
+    }
 
     template<typename Func>
     void start(Func&& func) {

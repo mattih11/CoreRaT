@@ -68,8 +68,24 @@ public:
 
     Thread(const Thread&) = delete;
     Thread& operator=(const Thread&) = delete;
-    Thread(Thread&&) = default;
-    Thread& operator=(Thread&&) = default;
+
+    Thread(Thread&& other) noexcept
+        : config_(std::move(other.config_))
+        , posix_thread_(other.posix_thread_)
+        , joinable_(other.joinable_) {
+        other.joinable_ = false;
+    }
+
+    Thread& operator=(Thread&& other) noexcept {
+        if (this != &other) {
+            if (joinable_) join();
+            config_        = std::move(other.config_);
+            posix_thread_  = other.posix_thread_;
+            joinable_      = other.joinable_;
+            other.joinable_ = false;
+        }
+        return *this;
+    }
 
     template<typename Func>
     void start(Func&& func) {
