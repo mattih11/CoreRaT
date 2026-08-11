@@ -86,19 +86,19 @@ public:
     void commit(LogLevel lvl, const char* msg, std::size_t len) noexcept override {
         UniqueLock lock{ring_mutex_};
 
-        if (head_ - tail_ >= RingSize) {
+        if (head_.load(std::memory_order_relaxed) - tail_.load(std::memory_order_relaxed) >= RingSize) {
             return;  // ring full — drop newest, preserve RT timing
         }
 
-        Entry& e     = ring_[head_ & (RingSize - 1)];
+        Entry& e     = ring_[head_.load(std::memory_order_relaxed) & (RingSize - 1)];
         e.timestamp  = Time::now();
         e.source_id  = source_id_;
         e.level      = lvl;
         e.message.clear();
         sertial::rt::append(e.message, msg, len);
 
-        ++head_;
-        ring_cv_.notify_one();
+        head_.fetch_add(1, std::memory_order_release);  // atomic: visible to drain thread
+        // No notify needed — drain thread polls head_ with a 1ms sleep.
     }
 
     // -------------------------------------------------------------------------
@@ -146,12 +146,6 @@ public:
     void stop_drain() noexcept {
         if (!drain_running_.exchange(false)) return;
 
-        // Wake drain thread so it can observe drain_running_ == false
-        {
-            UniqueLock lock{ring_mutex_};
-            ring_cv_.notify_one();
-        }
-
         if (drain_thread_.joinable()) {
             drain_thread_.join();
         }
@@ -168,11 +162,12 @@ public:
 private:
     // ---- Ring buffer --------------------------------------------------------
     std::array<Entry, RingSize>  ring_{};
-    std::size_t                  head_{0};  // written by RT committer
-    std::size_t                  tail_{0};  // consumed by drain thread
+    std::atomic<std::size_t>     head_{0};  // written by commit() (OOB); read by drain (in-band)
+    std::atomic<std::size_t>     tail_{0};  // written by drain thread; read by commit() for full-check
 
+    // ring_mutex_ guards concurrent OOB writers in commit().
+    // The drain thread does NOT lock ring_mutex_ — it reads head_ atomically.
     corerat::Mutex               ring_mutex_;
-    corerat::ConditionVariable   ring_cv_;
 
     // ---- Metadata -----------------------------------------------------------
     uint32_t                     source_id_;
@@ -189,35 +184,23 @@ private:
 
     void drain_loop() {
         while (drain_running_.load(std::memory_order_relaxed)) {
-            Entry local{};
-            bool  got_entry = false;
-
-            {
-                UniqueLock lock{ring_mutex_};
-                ring_cv_.wait_for(lock, Milliseconds(100), [this] {
-                    return head_ != tail_ || !drain_running_.load(std::memory_order_relaxed);
-                });
-
-                if (head_ != tail_) {
-                    local     = ring_[tail_ & (RingSize - 1)];
-                    ++tail_;
-                    got_entry = true;
-                }
+            // head_ is updated atomically by commit(); no evl_mutex needed here.
+            if (head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
             }
 
-            if (got_entry) {
-                // Dispatch to sinks outside the lock — sinks may block (printf, TCP)
-                // Reinterpret: Entry<MaxMsgLen> → ILogSink expects Entry<256>
-                // When MaxMsgLen != 256 we dispatch via the common interface using
-                // a temporary RtLogEntry<> with a shared base.
-                dispatch(local);
-            }
+            const std::size_t t = tail_.load(std::memory_order_relaxed);
+            Entry local = ring_[t & (RingSize - 1)];
+            tail_.store(t + 1, std::memory_order_release);
+            dispatch(local);
         }
 
         // Drain any remaining entries after stop signal
-        while (head_ != tail_) {
-            Entry local = ring_[tail_ & (RingSize - 1)];
-            ++tail_;
+        while (head_.load(std::memory_order_acquire) != tail_.load(std::memory_order_relaxed)) {
+            const std::size_t t = tail_.load(std::memory_order_relaxed);
+            Entry local = ring_[t & (RingSize - 1)];
+            tail_.store(t + 1, std::memory_order_release);
             dispatch(local);
         }
     }
