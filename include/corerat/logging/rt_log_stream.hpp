@@ -27,7 +27,7 @@
 
 #include "corerat/logging/log_level.hpp"
 #include "corerat/logging/rt_logger_base.hpp"
-#include "corerat/logging/detail/rt_append.hpp"
+#include <sertial/containers/rt_format.hpp>
 
 namespace corerat {
 
@@ -80,60 +80,60 @@ public:
     // -------------------------------------------------------------------------
 
     RtLogStream& operator<<(const char* s) noexcept {
-        if (active_) detail::append_rt(buf_, s);
+        if (active_) sertial::rt::append(buf_, s);
         return *this;
     }
 
     RtLogStream& operator<<(int32_t v) noexcept {
-        if (active_) detail::append_rt(buf_, static_cast<int64_t>(v));
+        if (active_) sertial::rt::append(buf_, static_cast<int64_t>(v));
         return *this;
     }
 
     RtLogStream& operator<<(uint32_t v) noexcept {
-        if (active_) detail::append_rt(buf_, static_cast<uint64_t>(v));
+        if (active_) sertial::rt::append(buf_, static_cast<uint64_t>(v));
         return *this;
     }
 
     RtLogStream& operator<<(int64_t v) noexcept {
-        if (active_) detail::append_rt(buf_, v);
+        if (active_) sertial::rt::append(buf_, v);
         return *this;
     }
 
     RtLogStream& operator<<(uint64_t v) noexcept {
-        if (active_) detail::append_rt(buf_, v);
+        if (active_) sertial::rt::append(buf_, v);
         return *this;
     }
 
     RtLogStream& operator<<(float v) noexcept {
-        if (active_) detail::append_rt(buf_, v);
+        if (active_) sertial::rt::append(buf_, v);
         return *this;
     }
 
     RtLogStream& operator<<(double v) noexcept {
-        if (active_) detail::append_rt(buf_, v);
+        if (active_) sertial::rt::append(buf_, v);
         return *this;
     }
 
     RtLogStream& operator<<(bool v) noexcept {
-        if (active_) detail::append_rt(buf_, v);
+        if (active_) sertial::rt::append(buf_, v);
         return *this;
     }
 
     /// @brief Hex-formatted integer.
     RtLogStream& operator<<(RtHex h) noexcept {
-        if (active_) detail::append_rt_hex(buf_, h.value, h.prefix);
+        if (active_) sertial::rt::append_hex(buf_, h.value, h.prefix);
         return *this;
     }
 
     RtLogStream& operator<<(RtHex32 h) noexcept {
-        if (active_) detail::append_rt_hex(buf_, static_cast<uint64_t>(h.value), h.prefix);
+        if (active_) sertial::rt::append_hex(buf_, static_cast<uint64_t>(h.value), h.prefix);
         return *this;
     }
 
     /// @brief Append from an existing sertial::fixed_string of any capacity.
     template<std::size_t OtherN>
     RtLogStream& operator<<(const sertial::fixed_string<OtherN>& s) noexcept {
-        if (active_) detail::append_rt(buf_, s.c_str(), s.size());
+        if (active_) sertial::rt::append(buf_, s.c_str(), s.size());
         return *this;
     }
 
