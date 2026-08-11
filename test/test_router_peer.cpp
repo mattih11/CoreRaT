@@ -20,16 +20,19 @@
 
 #include "corerat/ipc/tims/protocol.hpp"
 #include "corerat/ipc/tims/tcp_socket.hpp"
+#include <corerat/logging/logging.hpp>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <thread>
 
 using namespace corerat;
 using namespace corerat::tims_proto;
 
+static corerat::TerminalSink g_sink{};
+static corerat::RtLogger<64> g_logger{0x00000005u, corerat::LogLevel::Trace};
+
 static bool ok(bool cond, const char* msg) {
-    if (!cond) std::printf("FAIL: %s\n", msg);
+    if (!cond) RTLOG_ERROR(g_logger) << "FAIL: " << msg;
     return cond;
 }
 
@@ -66,7 +69,10 @@ static bool send_delete(TcpSocket& sock, uint32_t mbx_id) {
 }
 
 int main() {
-    std::printf("=== test_router_peer ===\n");
+    g_logger.add_sink(&g_sink);
+    g_logger.start_drain();
+
+    RTLOG_INFO(g_logger) << "=== test_router_peer ===";
     bool all_pass = true;
 
     // ── Connect to both routers ───────────────────────────────────────────
@@ -77,7 +83,8 @@ int main() {
     all_pass &= ok(b.is_open(), "connect to router B (port 2001)");
 
     if (!a.is_open() || !b.is_open()) {
-        std::printf("FAILED — cannot connect to routers\n");
+        RTLOG_FATAL(g_logger) << "FAILED — cannot connect to routers";
+        g_logger.stop_drain();
         return 1;
     }
 
@@ -94,7 +101,7 @@ int main() {
     // ── Test 1: A→B forwarding ────────────────────────────────────────────
     // Register 0xA001 on router A, register 0xB001 on router B.
     // Send from A to 0xB001 — router A must forward to router B.
-    std::printf("\n[1] Cross-router forwarding A→B\n");
+    RTLOG_INFO(g_logger) << "[1] Cross-router forwarding A->B";
 
     all_pass &= ok(send_register(a, 0xA001), "register 0xA001 on A");
     all_pass &= ok(send_register(b, 0xB001), "register 0xB001 on B");
@@ -136,7 +143,7 @@ int main() {
             if (body_len == sizeof(uint32_t)) {
                 b.recv_all(&fwd_payload, sizeof(fwd_payload));
                 all_pass &= ok(fwd_payload == 0xCAFEBABE, "forwarded payload matches");
-                std::printf("  fwd_payload = 0x%08X (expected 0xCAFEBABE)\n", fwd_payload);
+                RTLOG_INFO(g_logger) << "  fwd_payload = " << corerat::RtHex32{fwd_payload} << " (expected 0xCAFEBABE)";
             } else {
                 all_pass &= ok(false, "unexpected body_len for forwarded frame");
             }
@@ -146,7 +153,7 @@ int main() {
     }
 
     // ── Test 2: B→A forwarding ────────────────────────────────────────────
-    std::printf("\n[2] Cross-router forwarding B→A\n");
+    RTLOG_INFO(g_logger) << "[2] Cross-router forwarding B->A";
 
     TcpSocket b_tx = connect_with_retry("127.0.0.1", 2001);
     all_pass &= ok(b_tx.is_open(), "connect tx to router B");
@@ -173,7 +180,7 @@ int main() {
             if (body_len2 == sizeof(uint32_t)) {
                 a.recv_all(&fwd_payload2, sizeof(fwd_payload2));
                 all_pass &= ok(fwd_payload2 == 0x12345678, "forwarded payload2 matches");
-                std::printf("  fwd_payload2 = 0x%08X (expected 0x12345678)\n", fwd_payload2);
+                RTLOG_INFO(g_logger) << "  fwd_payload2 = " << corerat::RtHex32{fwd_payload2} << " (expected 0x12345678)";
             } else {
                 all_pass &= ok(false, "unexpected body_len for forwarded frame 2");
             }
@@ -183,7 +190,7 @@ int main() {
     }
 
     // ── Test 3: PEER_DELETE propagation ──────────────────────────────────
-    std::printf("\n[3] Mailbox delete propagates across peer\n");
+    RTLOG_INFO(g_logger) << "[3] Mailbox delete propagates across peer";
 
     // Register 0xA003 on A, wait for peer advertisement, delete it, verify
     // sending to it from B gives no forwarded frame (times out).
@@ -203,9 +210,10 @@ int main() {
         // poll_in with 300ms timeout; expect timeout.
         const bool no_spurious = (a.poll_in(300) <= 0);
         all_pass &= ok(no_spurious, "no forwarded frame after delete (expected timeout)");
-        if (no_spurious) std::printf("  correctly timed out — 0xA003 not found\n");
+        if (no_spurious) RTLOG_INFO(g_logger) << "  correctly timed out -- 0xA003 not found";
     }
 
-    std::printf("\n%s\n", all_pass ? "ALL PASS" : "SOME TESTS FAILED");
+    RTLOG_INFO(g_logger) << (all_pass ? "ALL PASS" : "SOME TESTS FAILED");
+    g_logger.stop_drain();
     return all_pass ? 0 : 1;
 }

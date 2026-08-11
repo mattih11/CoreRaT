@@ -11,11 +11,14 @@
 #include "corerat/messaging/message_registry.hpp"
 #include "corerat/messaging/wire_message.hpp"
 #include <sertial/sertial.hpp>
-#include <iostream>
+#include <corerat/logging/logging.hpp>
 #include <cassert>
 #include <array>
 
 using namespace corerat;
+
+static corerat::TerminalSink g_sink{};
+static corerat::RtLogger<64> g_logger{0x00000003u, corerat::LogLevel::Trace};
 
 // Test payload types
 struct TinyCmd    { uint8_t  value; };
@@ -31,7 +34,10 @@ using TestRegistry = MessageRegistry<
 >;
 
 int main() {
-    std::cout << "=== CoreRaT WireMessage buffer sizing test ===\n\n";
+    g_logger.add_sink(&g_sink);
+    g_logger.start_drain();
+
+    RTLOG_INFO(g_logger) << "=== CoreRaT WireMessage buffer sizing test ===";
 
     // Individual sizes (WireHeader + payload, serialised)
     constexpr size_t tiny_size   = sertial::Message<WireMessage<TinyCmd>>::max_buffer_size;
@@ -39,50 +45,42 @@ int main() {
     constexpr size_t medium_size = sertial::Message<WireMessage<MediumData>>::max_buffer_size;
     constexpr size_t large_size  = sertial::Message<WireMessage<LargeData>>::max_buffer_size;
 
-    std::cout << "Individual serialised sizes (WireHeader + payload):\n"
-              << "  TinyCmd:    " << tiny_size   << " bytes\n"
-              << "  SmallCmd:   " << small_size  << " bytes\n"
-              << "  MediumData: " << medium_size << " bytes\n"
-              << "  LargeData:  " << large_size  << " bytes\n\n";
+    RTLOG_INFO(g_logger) << "Individual serialised sizes (WireHeader + payload):";
+    RTLOG_INFO(g_logger) << "  TinyCmd:    " << static_cast<uint64_t>(tiny_size)   << " bytes";
+    RTLOG_INFO(g_logger) << "  SmallCmd:   " << static_cast<uint64_t>(small_size)  << " bytes";
+    RTLOG_INFO(g_logger) << "  MediumData: " << static_cast<uint64_t>(medium_size) << " bytes";
+    RTLOG_INFO(g_logger) << "  LargeData:  " << static_cast<uint64_t>(large_size)  << " bytes";
 
     // WireHeader: 2×uint32 + uint64 + 4×uint32 = 4+4+8+4+4+4+4 = 32 bytes
     static_assert(sizeof(WireHeader) == 32, "WireHeader size mismatch");
-    std::cout << "  WireHeader size: " << sizeof(WireHeader) << " bytes (expected 32): PASS\n\n";
+    RTLOG_INFO(g_logger) << "  WireHeader size: " << static_cast<uint64_t>(sizeof(WireHeader)) << " bytes (expected 32): PASS";
 
     // Registry max_message_size = largest WireMessage in the registry (no GetData expansion)
     constexpr size_t registry_max = TestRegistry::max_message_size;
     assert(registry_max == large_size);
-    std::cout << "Registry::max_message_size: " << registry_max
-              << " bytes (matches LargeData): PASS\n\n";
+    RTLOG_INFO(g_logger) << "Registry::max_message_size: " << static_cast<uint64_t>(registry_max) << " bytes (matches LargeData): PASS";
 
     // max_size_for_types<> — subset optimisation
     constexpr size_t cmd_max = TestRegistry::max_size_for_types<TinyCmd, SmallCmd>();
     assert(cmd_max == small_size);
     assert(cmd_max < medium_size);
-    std::cout << "max_size_for_types<TinyCmd, SmallCmd>: " << cmd_max
-              << " bytes (matches SmallCmd): PASS\n";
-    std::cout << "  Memory saving vs registry_max: "
-              << (registry_max - cmd_max) << " bytes ("
-              << (100.0 * (registry_max - cmd_max) / registry_max) << "%)\n\n";
+    RTLOG_INFO(g_logger) << "max_size_for_types<TinyCmd, SmallCmd>: " << static_cast<uint64_t>(cmd_max) << " bytes (matches SmallCmd): PASS";
+    RTLOG_INFO(g_logger) << "  Memory saving vs registry_max: " << static_cast<uint64_t>(registry_max - cmd_max) << " bytes (" << (100.0 * static_cast<double>(registry_max - cmd_max) / static_cast<double>(registry_max)) << "%)";
 
     constexpr size_t tiny_only = TestRegistry::max_size_for_types<TinyCmd>();
     assert(tiny_only == tiny_size);
-    std::cout << "max_size_for_types<TinyCmd>: " << tiny_only
-              << " bytes (matches TinyCmd): PASS\n";
-    std::cout << "  Memory saving vs registry_max: "
-              << (registry_max - tiny_only) << " bytes ("
-              << (100.0 * (registry_max - tiny_only) / registry_max) << "%)\n\n";
+    RTLOG_INFO(g_logger) << "max_size_for_types<TinyCmd>: " << static_cast<uint64_t>(tiny_only) << " bytes (matches TinyCmd): PASS";
+    RTLOG_INFO(g_logger) << "  Memory saving vs registry_max: " << static_cast<uint64_t>(registry_max - tiny_only) << " bytes (" << (100.0 * static_cast<double>(registry_max - tiny_only) / static_cast<double>(registry_max)) << "%)";
 
     constexpr size_t data_max = TestRegistry::max_size_for_types<MediumData>();
     assert(data_max == medium_size);
-    std::cout << "max_size_for_types<MediumData>: " << data_max
-              << " bytes (matches MediumData): PASS\n\n";
+    RTLOG_INFO(g_logger) << "max_size_for_types<MediumData>: " << static_cast<uint64_t>(data_max) << " bytes (matches MediumData): PASS";
 
     // is_registered checks
     static_assert( TestRegistry::is_registered<TinyCmd>,    "TinyCmd not registered");
     static_assert( TestRegistry::is_registered<LargeData>,  "LargeData not registered");
-    std::cout << "is_registered<T>: PASS\n\n";
-
-    std::cout << "=== ALL TESTS PASSED ===\n";
+    RTLOG_INFO(g_logger) << "is_registered<T>: PASS";
+    RTLOG_INFO(g_logger) << "=== ALL TESTS PASSED ===";
+    g_logger.stop_drain();
     return 0;
 }

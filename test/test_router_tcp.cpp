@@ -9,7 +9,7 @@
 
 #include "corerat/ipc/tims/protocol.hpp"
 #include "corerat/ipc/tims/tcp_socket.hpp"
-#include <cstdio>
+#include <corerat/logging/logging.hpp>
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -17,13 +17,19 @@
 using namespace corerat;
 using namespace corerat::tims_proto;
 
+static corerat::TerminalSink g_sink{};
+static corerat::RtLogger<64> g_logger{0x00000004u, corerat::LogLevel::Trace};
+
 static bool check(bool cond, const char* msg) {
-    if (!cond) std::printf("FAIL: %s\n", msg);
+    if (!cond) RTLOG_ERROR(g_logger) << "FAIL: " << msg;
     return cond;
 }
 
 int main() {
-    std::printf("=== test_router_tcp ===\n");
+    g_logger.add_sink(&g_sink);
+    g_logger.start_drain();
+
+    RTLOG_INFO(g_logger) << "=== test_router_tcp ===";
     bool all_pass = true;
 
     // ------------------------------------------------------------------
@@ -61,8 +67,8 @@ int main() {
         FrameHeader reply{};
         all_pass &= check(sock.recv_all(&reply, sizeof(reply)), "recv reply");
         all_pass &= check(reply.type == MSG_OK, "reply is MSG_OK");
-        std::printf("  reply.type = %d (expected %d)\n",
-                    static_cast<int>(reply.type), static_cast<int>(MSG_OK));
+        RTLOG_INFO(g_logger) << "  reply.type = " << static_cast<int32_t>(reply.type)
+                             << " (expected " << static_cast<int32_t>(MSG_OK) << ")";
     }
 
     // ------------------------------------------------------------------
@@ -115,10 +121,10 @@ int main() {
         all_pass &= check(rx.recv_all(&fwd_payload, sizeof(fwd_payload)),
                          "recv forwarded payload");
         all_pass &= check(fwd_payload == 0xDEADBEEF, "forwarded payload matches");
-        std::printf("  forwarded payload = 0x%08X (expected 0xDEADBEEF)\n",
-                    fwd_payload);
+            RTLOG_INFO(g_logger) << "  forwarded payload = " << corerat::RtHex32{fwd_payload} << " (expected 0xDEADBEEF)";
     }
 
-    std::printf("\n%s\n", all_pass ? "ALL PASS" : "SOME TESTS FAILED");
+    RTLOG_INFO(g_logger) << (all_pass ? "ALL PASS" : "SOME TESTS FAILED");
+    g_logger.stop_drain();
     return all_pass ? 0 : 1;
 }

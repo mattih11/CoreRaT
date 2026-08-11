@@ -8,10 +8,13 @@
 
 #include "corerat/messaging/message_id.hpp"
 #include "corerat/messaging/message_registry.hpp"
-#include <iostream>
+#include <corerat/logging/logging.hpp>
 #include <cassert>
 
 using namespace corerat;
+
+static corerat::TerminalSink g_sink{};
+static corerat::RtLogger<64> g_logger{0x00000001u, corerat::LogLevel::Trace};
 
 // Test payload types
 struct AutoID1 { int value; };
@@ -21,18 +24,21 @@ struct ManualID100 { int value; };
 struct ReplyPayload { bool success; };
 
 int main() {
-    std::cout << "Testing CoreRaT message ID assignment and validation...\n";
+    g_logger.add_sink(&g_sink);
+    g_logger.start_drain();
+
+    RTLOG_INFO(g_logger) << "Testing CoreRaT message ID assignment and validation...";
 
     // Test 1: AUTO_ID marker is 0
     {
         static_assert(DefaultMessageDef::id == 0, "AUTO_ID should be 0");
-        std::cout << "  AUTO_ID = 0: PASS\n";
+        RTLOG_INFO(g_logger) << "  AUTO_ID = 0: PASS";
     }
 
     // Test 2: MAX_MESSAGE_ID is 0x7FFF
     {
         static_assert(MAX_MESSAGE_ID == 0x7FFF, "MAX_MESSAGE_ID should be 0x7FFF");
-        std::cout << "  MAX_MESSAGE_ID = 0x7FFF: PASS\n";
+        RTLOG_INFO(g_logger) << "  MAX_MESSAGE_ID = 0x7FFF: PASS";
     }
 
     // Test 3: Auto-assigned IDs start at 1 after registry processing
@@ -56,7 +62,7 @@ int main() {
         static_assert(Def1::local_id == 2, "Second auto-ID should be 2");
         static_assert(Def2::local_id == 3, "Third auto-ID should be 3");
 
-        std::cout << "  Auto-assigned IDs (1, 2, 3): PASS\n";
+        RTLOG_INFO(g_logger) << "  Auto-assigned IDs (1, 2, 3): PASS";
     }
 
     // Test 4: Reply ID = bitwise NOT of request ID
@@ -79,7 +85,7 @@ int main() {
         static_assert(reply_id == -req_id,              "Reply ID = -Request ID");
         static_assert(static_cast<uint16_t>(reply_id) == 0xFFFF, "Reply ID as uint16 = 0xFFFF");
 
-        std::cout << "  Reply ID = -Request ID: PASS\n";
+        RTLOG_INFO(g_logger) << "  Reply ID = -Request ID: PASS";
     }
 
     // Test 5: Manual ID within range is preserved
@@ -94,7 +100,7 @@ int main() {
         static_assert(ValidMsg::local_id == 100, "Manual ID should be preserved");
         static_assert(!ValidMsg::needs_auto_id,  "Should not need auto ID");
 
-        std::cout << "  Manual ID preserved: PASS\n";
+        RTLOG_INFO(g_logger) << "  Manual ID preserved: PASS";
     }
 
     // Test 6: MAX_MESSAGE_ID boundary (0x7FFF) is accepted
@@ -108,7 +114,7 @@ int main() {
 
         static_assert(MaxMsg::local_id == 0x7FFF, "Should allow MAX_MESSAGE_ID");
 
-        std::cout << "  MAX_MESSAGE_ID boundary (0x7FFF): PASS\n";
+        RTLOG_INFO(g_logger) << "  MAX_MESSAGE_ID boundary (0x7FFF): PASS";
     }
 
     // Test 7: Negative IDs (reply messages) detected correctly
@@ -126,14 +132,14 @@ int main() {
         static_assert(!ReplyMsg::is_request,"Should not be request");
         static_assert(!ReplyMsg::has_reply, "Reply should not have reply");
 
-        std::cout << "  Negative IDs (reply messages): PASS\n";
+        RTLOG_INFO(g_logger) << "  Negative IDs (reply messages): PASS";
     }
 
     // Test 8: make_message_id produces correct 32-bit value
     {
         constexpr uint32_t id = make_message_id(0x01, 0x00, 0x0001);
         static_assert(id == 0x01000001, "make_message_id encoding");
-        std::cout << "  make_message_id encoding: PASS\n";
+        RTLOG_INFO(g_logger) << "  make_message_id encoding: PASS";
     }
 
     // Test 9: is_registered<T> works on processed registry
@@ -141,9 +147,10 @@ int main() {
         using Msg = MessageDefinition<AutoID1, MessagePrefix::UserDefined, UserSubPrefix::Data>;
         using Reg = MessageRegistry<Msg>;
         static_assert(Reg::is_registered<AutoID1>, "AutoID1 should be registered");
-        std::cout << "  is_registered<T>: PASS\n";
+        RTLOG_INFO(g_logger) << "  is_registered<T>: PASS";
     }
 
-    std::cout << "\nAll message ID tests PASSED!\n";
+    RTLOG_INFO(g_logger) << "All message ID tests PASSED!";
+    g_logger.stop_drain();
     return 0;
 }
