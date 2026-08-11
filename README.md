@@ -16,6 +16,7 @@ CoreRaT provides three independently usable layers:
 | **Platform** | `include/corerat/platform/` | `Thread`, `Mutex`, `Timestamp`, `Duration` — backed by `std::` (default) or Xenomai 4 EVL primitives |
 | **Messaging** | `include/corerat/messaging/` | Compile-time `MessageRegistry<>`, `WireMessage<T>`, `WireHeader` (RACK-compatible wire format), `MessageDefinition<>` |
 | **IPC** | `include/corerat/ipc/` | `Mailbox<>` with three backends: TiMS TCP, EVL SHM, EVL OOB UDP |
+| **Logging** | `include/corerat/logging/` | `RtLogger<>` — OOB-safe ring-buffer logger with `<<` stream API, `TerminalSink`, `TimsSink` |
 
 ---
 
@@ -164,6 +165,136 @@ mbx.receive_any_for(Seconds(1), [&](auto&& msg) {
 ```cpp
 cfg.cross_process = true;   // uses POSIX SHM ring instead of heap ring
 // everything else identical
+```
+
+---
+
+## RT Logging
+
+`#include <corerat/logging/logging.hpp>`
+
+CoreRaT provides a zero-allocation, OOB-safe logging service that works on both the STD and EVL platforms.
+
+### Design
+
+```
+RT thread (corerat::Thread)          in-band drain thread (std::thread)
+────────────────────────────         ──────────────────────────────────
+RTLOG_INFO(logger_) << "v=" << v;    (woken by ConditionVariable)
+  → RtLogStream assembles message        for each entry in ring:
+    in a sertial::fixed_string<N>            sink.write(entry)
+  → ~RtLogStream calls commit()                 TerminalSink → printf
+      corerat::Mutex lock                        TimsSink    → TCP send
+      write to ring slot
+      signal ConditionVariable
+      unlock
+```
+
+**Key properties:**
+
+| Property | Behaviour |
+|---|---|
+| RT commit path | OOB-safe: `evl_mutex` on EVL, `std::mutex` on STD |
+| Ring-full policy | Drop newest entry — RT thread **never blocks** |
+| Drain thread | Plain `std::thread` (NOT `corerat::Thread`) so it stays in-band on EVL and may call `printf` / `::send` |
+| Heap allocation | Zero in the hot path — `fixed_string<MaxMsgLen>` on the stack |
+| Exceptions | None — all `operator<<` overloads and `commit()` are `noexcept` |
+| Float formatting | Custom fixed-point (`sertial::rt::append_double`) — no `glibc` float functions |
+
+### Quick start
+
+```cpp
+#include <corerat/logging/logging.hpp>
+
+class MySensor {
+    corerat::RtLogger<64> logger_{mailbox_id_};
+    corerat::TerminalSink terminal_sink_{};
+
+    int moduleInit() {
+        logger_.add_sink(&terminal_sink_);
+        logger_.start_drain();    // spawns the in-band drain thread
+        return 0;
+    }
+
+    void moduleCleanup() {
+        logger_.stop_drain();     // flushes ring, joins drain thread
+    }
+
+    void loop() {
+        RTLOG_INFO(logger_)  << "speed=" << speed_ << " hdg=" << heading_;
+        RTLOG_ERROR(logger_) << "fault=0x" << corerat::RtHex{fault_code_};
+        RTLOG_DEBUG(logger_) << "temp=" << temp_ << " (raw=" << raw_ << ")";
+    }
+};
+```
+
+### Supported `operator<<` types
+
+| Type | Example |
+|---|---|
+| `const char*` | `<< "label"` |
+| `int32_t`, `int64_t` | `<< -42` |
+| `uint32_t`, `uint64_t` | `<< 42u` |
+| `float`, `double` | `<< 3.14f` (3 decimal places by default) |
+| `bool` | `<< true` → `"true"` |
+| `RtHex{v}` / `RtHex32{v}` | `<< RtHex{0xDEAD}` → `"0xDEAD"` |
+| `sertial::fixed_string<N>` | direct append, no copy |
+
+For custom decimal precision use `sertial::rt::append_double<N, Decimals>()` directly.
+
+### Log levels
+
+Levels map to GDOS/TiMS wire types for RaTGUI compatibility:
+
+| Level | `RTLOG_*` macro | GDOS wire type | Typical use |
+|---|---|---|---|
+| `Fatal` | `RTLOG_FATAL` | `GDOS_MSG_PRINT` (-124) | System-critical, always shown |
+| `Error` | `RTLOG_ERROR` | `GDOS_MSG_ERROR` (-125) | Recoverable error |
+| `Warn`  | `RTLOG_WARN`  | `GDOS_MSG_WARNING` (-126) | Unexpected but non-fatal |
+| `Info`  | `RTLOG_INFO`  | `GDOS_MSG_DBG_INFO` (-127) | Normal status |
+| `Debug` | `RTLOG_DEBUG` | `GDOS_MSG_DBG_DETAIL` (-128) | Developer detail |
+| `Trace` | `RTLOG_TRACE` | `GDOS_MSG_DBG_DETAIL` (-128) | Hot-path tracing |
+
+Entries below `logger_.level()` are filtered at the `RtLogStream` constructor — the `operator<<` chain is **never entered**, making filtered-out log lines zero-cost.
+
+Runtime level changes are thread-safe:
+
+```cpp
+logger_.set_level(corerat::LogLevel::Warn);  // suppress Info + Debug + Trace
+```
+
+### Sinks
+
+| Sink | Header | Description |
+|---|---|---|
+| `TerminalSink` | `logging/log_sink.hpp` | Coloured `printf` output: `[HH:MM:SS.mmm] [LEVEL] [src=XXXXXXXX] message` |
+| `TimsSink` | `logging/log_sink.hpp` | Sends GDOS TiMS frames to `corerat-router-tcp` → RaTGUI |
+| Custom | implement `ILogSink` | Override `void write(const RtLogEntry<>&) noexcept` |
+
+`TimsSink` takes a borrowed TCP socket file descriptor:
+
+```cpp
+corerat::TimsSink tims_sink_{tcp_fd_, mailbox_id_};
+logger_.add_sink(&tims_sink_);
+```
+
+Up to 4 sinks per logger. All sinks run in the in-band drain thread; they may block.
+
+### Template parameters
+
+```cpp
+corerat::RtLogger<RingSize, MaxMsgLen>
+//  RingSize  — ring slot count, must be power-of-2 (default 64)
+//  MaxMsgLen — max chars per message, excl. null terminator (default 256)
+```
+
+Memory footprint per logger (on stack / as a member): `RingSize × (8 + 4 + 1 + MaxMsgLen + 4)` bytes.  
+Default `RtLogger<64, 256>` ≈ **17 KB**.
+
+A tight-loop trace logger that only needs short messages:
+
+```cpp
+corerat::RtLogger<128, 64> trace_logger_{mailbox_id_};  // ≈ 10 KB
 ```
 
 ---
