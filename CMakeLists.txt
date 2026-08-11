@@ -76,7 +76,6 @@ target_link_libraries(corerat INTERFACE
 
 target_compile_definitions(corerat INTERFACE
     CORERAT_PLATFORM_${CORERAT_PLATFORM}
-    CORERAT_IPC_${CORERAT_IPC}
 )
 
 target_compile_options(corerat INTERFACE
@@ -100,6 +99,7 @@ if(CORERAT_IPC STREQUAL "TIMS")
     add_library(corerat_tims STATIC src/tims_backend.cpp)
     add_library(CoreRaT::corerat_tims ALIAS corerat_tims)
 
+    target_compile_definitions(corerat_tims PUBLIC CORERAT_IPC_TIMS)
     target_link_libraries(corerat_tims PUBLIC corerat)
 
     install(TARGETS corerat_tims
@@ -107,7 +107,22 @@ if(CORERAT_IPC STREQUAL "TIMS")
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
 elseif(CORERAT_IPC STREQUAL "EVL")
-    # EVL backend is header-only; callers link CoreRaT::corerat + EVL::evl
+    # EVL backend is header-only — no compiled TU.
+    # corerat_evl is an INTERFACE target that:
+    #   1. Pulls in corerat (platform + messaging headers)
+    #   2. Defines CORERAT_IPC_EVL so mailbox.hpp selects EvlMailbox
+    #   3. Links libevl
+    # Downstream consumers (CommRaT etc.) link CoreRaT::corerat_evl instead of
+    # CoreRaT::corerat to get the EVL IPC backend.
+    add_library(corerat_evl INTERFACE)
+    add_library(CoreRaT::corerat_evl ALIAS corerat_evl)
+
+    target_compile_definitions(corerat_evl INTERFACE CORERAT_IPC_EVL)
+    target_link_libraries(corerat_evl INTERFACE corerat)
+
+    install(TARGETS corerat_evl
+        EXPORT CoreRaTTargets
+    )
 endif()
 
 # ============================================================================
