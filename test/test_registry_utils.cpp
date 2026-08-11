@@ -10,10 +10,13 @@
 #include "corerat/messaging/message_id.hpp"
 #include "corerat/messaging/message_registry.hpp"
 #include "corerat/messaging/registry_utils.hpp"
-#include <iostream>
+#include <corerat/logging/logging.hpp>
 #include <cassert>
 
 using namespace corerat;
+
+static corerat::TerminalSink g_sink{};
+static corerat::RtLogger<64> g_logger{0x00000002u, corerat::LogLevel::Trace};
 
 // ============================================================================
 // Test Message Definitions
@@ -43,42 +46,42 @@ using TestRegistry = MessageRegistry<
 // ============================================================================
 
 void test_category_filters() {
-    std::cout << "Testing category filters...\n";
+    RTLOG_INFO(g_logger) << "Testing category filters...";
 
     using DataMsgs = registry::data_messages_t<TestRegistry>;
     constexpr size_t num_data = registry::tuple_size_v<DataMsgs>;
     static_assert(num_data == 2, "Should have 2 data messages");
-    std::cout << "  Data messages: " << num_data << " (expected 2): PASS\n";
+    RTLOG_INFO(g_logger) << "  Data messages: " << static_cast<uint64_t>(num_data) << " (expected 2): PASS";
 
     using CommandMsgs = registry::command_messages_t<TestRegistry>;
     constexpr size_t num_commands = registry::tuple_size_v<CommandMsgs>;
     // 2 request + 2 reply = 4 command messages after registry expansion
     static_assert(num_commands == 4, "Should have 4 command messages (2 request + 2 reply)");
-    std::cout << "  Command messages: " << num_commands << " (expected 4): PASS\n";
+    RTLOG_INFO(g_logger) << "  Command messages: " << static_cast<uint64_t>(num_commands) << " (expected 4): PASS";
 
     // No subscription messages in a bare CoreRaT registry
     using SubMsgs = registry::subscription_messages_t<TestRegistry>;
     constexpr size_t num_sub = registry::tuple_size_v<SubMsgs>;
     static_assert(num_sub == 0, "No subscription messages in a CoreRaT registry");
-    std::cout << "  Subscription messages: " << num_sub << " (expected 0, CommRaT adds these): PASS\n";
+    RTLOG_INFO(g_logger) << "  Subscription messages: " << static_cast<uint64_t>(num_sub) << " (expected 0, CommRaT adds these): PASS";
 }
 
 void test_prefix_filters() {
-    std::cout << "Testing prefix filters...\n";
+    RTLOG_INFO(g_logger) << "Testing prefix filters...";
 
     using UserMsgs = registry::filter_by_prefix_t<MessagePrefix::UserDefined, TestRegistry>;
     constexpr size_t num_user = registry::tuple_size_v<UserMsgs>;
     static_assert(num_user > 0, "Should have user-defined messages");
-    std::cout << "  UserDefined messages: " << num_user << ": PASS\n";
+    RTLOG_INFO(g_logger) << "  UserDefined messages: " << static_cast<uint64_t>(num_user) << ": PASS";
 
     using SystemMsgs = registry::filter_by_prefix_t<MessagePrefix::System, TestRegistry>;
     constexpr size_t num_system = registry::tuple_size_v<SystemMsgs>;
     static_assert(num_system == 0, "No system messages in a bare CoreRaT registry");
-    std::cout << "  System messages: " << num_system << " (expected 0, CommRaT adds these): PASS\n";
+    RTLOG_INFO(g_logger) << "  System messages: " << static_cast<uint64_t>(num_system) << " (expected 0, CommRaT adds these): PASS";
 }
 
 void test_subprefix_filters() {
-    std::cout << "Testing subprefix filters...\n";
+    RTLOG_INFO(g_logger) << "Testing subprefix filters...";
 
     using UserDataMsgs = registry::filter_by_subprefix_t<
         MessagePrefix::UserDefined,
@@ -87,7 +90,7 @@ void test_subprefix_filters() {
     >;
     constexpr size_t num_data = registry::tuple_size_v<UserDataMsgs>;
     static_assert(num_data == 2, "Should have exactly 2 user data messages");
-    std::cout << "  UserDefined::Data: " << num_data << " (expected 2): PASS\n";
+    RTLOG_INFO(g_logger) << "  UserDefined::Data: " << static_cast<uint64_t>(num_data) << " (expected 2): PASS";
 
     using UserCmdMsgs = registry::filter_by_subprefix_t<
         MessagePrefix::UserDefined,
@@ -96,70 +99,74 @@ void test_subprefix_filters() {
     >;
     constexpr size_t num_cmd = registry::tuple_size_v<UserCmdMsgs>;
     static_assert(num_cmd == 4, "Should have 4 command messages (2 req + 2 reply)");
-    std::cout << "  UserDefined::Commands: " << num_cmd << " (expected 4): PASS\n";
+    RTLOG_INFO(g_logger) << "  UserDefined::Commands: " << static_cast<uint64_t>(num_cmd) << " (expected 4): PASS";
 }
 
 void test_request_reply_filters() {
-    std::cout << "Testing request/reply filters...\n";
+    RTLOG_INFO(g_logger) << "Testing request/reply filters...";
 
     using Requests = registry::filter_requests_t<TestRegistry>;
     constexpr size_t num_requests = registry::tuple_size_v<Requests>;
-    std::cout << "  Request messages: " << num_requests << "\n";
+    RTLOG_INFO(g_logger) << "  Request messages: " << static_cast<uint64_t>(num_requests);
 
     using Replies = registry::filter_replies_t<TestRegistry>;
     constexpr size_t num_replies = registry::tuple_size_v<Replies>;
-    std::cout << "  Reply messages: " << num_replies << "\n";
+    RTLOG_INFO(g_logger) << "  Reply messages: " << static_cast<uint64_t>(num_replies);
 
     static_assert(num_requests == num_replies, "Should have equal requests and replies");
     static_assert(num_requests == 2, "Should have exactly 2 request messages");
-    std::cout << "  Request/reply symmetry (2 each): PASS\n";
+    RTLOG_INFO(g_logger) << "  Request/reply symmetry (2 each): PASS";
 }
 
 void test_convenience_counters() {
-    std::cout << "Testing convenience counter functions...\n";
+    RTLOG_INFO(g_logger) << "Testing convenience counter functions...";
 
     constexpr size_t data_count = registry::data_message_count<TestRegistry>();
     constexpr size_t cmd_count  = registry::command_message_count<TestRegistry>();
     constexpr size_t req_count  = registry::request_message_count<TestRegistry>();
     constexpr size_t rep_count  = registry::reply_message_count<TestRegistry>();
 
-    std::cout << "  Data:     " << data_count << "\n"
-              << "  Commands: " << cmd_count  << "\n"
-              << "  Requests: " << req_count  << "\n"
-              << "  Replies:  " << rep_count  << "\n";
+    RTLOG_INFO(g_logger) << "  Data:     " << static_cast<uint64_t>(data_count);
+    RTLOG_INFO(g_logger) << "  Commands: " << static_cast<uint64_t>(cmd_count);
+    RTLOG_INFO(g_logger) << "  Requests: " << static_cast<uint64_t>(req_count);
+    RTLOG_INFO(g_logger) << "  Replies:  " << static_cast<uint64_t>(rep_count);
 
     static_assert(data_count == 2, "Data count mismatch");
     static_assert(cmd_count  == 4, "Command count mismatch (2 req + 2 reply)");
     static_assert(req_count  == rep_count, "Request/reply count mismatch");
-    std::cout << "  Convenience counters: PASS\n";
+    RTLOG_INFO(g_logger) << "  Convenience counters: PASS";
 }
 
 void test_registry_stats() {
-    std::cout << "Testing RegistryStats introspection...\n";
+    RTLOG_INFO(g_logger) << "Testing RegistryStats introspection...";
 
     using Stats = registry::RegistryStats<TestRegistry>;
-    std::cout << "  Total: " << Stats::total_messages << "  Data: " << Stats::data_messages
-              << "  Cmd: " << Stats::command_messages << "  Sub: " << Stats::subscription_messages
-              << "  Req: " << Stats::request_messages << "  Rep: " << Stats::reply_messages << "\n";
-    std::cout << "  RegistryStats: PASS\n";
+    RTLOG_INFO(g_logger)
+        << "  Total: " << static_cast<uint64_t>(Stats::total_messages)
+        << "  Data: "  << static_cast<uint64_t>(Stats::data_messages)
+        << "  Cmd: "   << static_cast<uint64_t>(Stats::command_messages)
+        << "  Sub: "   << static_cast<uint64_t>(Stats::subscription_messages)
+        << "  Req: "   << static_cast<uint64_t>(Stats::request_messages)
+        << "  Rep: "   << static_cast<uint64_t>(Stats::reply_messages);
+    RTLOG_INFO(g_logger) << "  RegistryStats: PASS";
 }
 
 void test_payload_extraction() {
-    std::cout << "Testing payload extraction...\n";
+    RTLOG_INFO(g_logger) << "Testing payload extraction...";
 
     using AllPayloads = registry::get_all_payloads_t<TestRegistry>;
     constexpr size_t num_payloads = registry::tuple_size_v<AllPayloads>;
-    std::cout << "  Total payload types: " << num_payloads << "\n";
+    RTLOG_INFO(g_logger) << "  Total payload types: " << static_cast<uint64_t>(num_payloads);
 
     using DataMsgs = registry::data_messages_t<TestRegistry>;
     using DataPayloads = registry::extract_payloads_t<DataMsgs>;
     constexpr size_t num_data_payloads = registry::tuple_size_v<DataPayloads>;
     static_assert(num_data_payloads == 2, "Should have 2 data payloads");
-    std::cout << "  Data payload types: " << num_data_payloads << " (expected 2): PASS\n";
+    RTLOG_INFO(g_logger) << "  Data payload types: " << static_cast<uint64_t>(num_data_payloads) << " (expected 2): PASS";
 }
 
 void test_tuple_utilities() {
-    std::cout << "Testing tuple utilities...\n";
+    RTLOG_INFO(g_logger) << "Testing tuple utilities...";
 
     using EmptyTuple = std::tuple<>;
     static_assert(registry::is_empty_tuple_v<EmptyTuple>, "Empty tuple check failed");
@@ -172,11 +179,11 @@ void test_tuple_utilities() {
     static_assert( registry::contains_type_v<float, TestTuple>, "Should contain float");
     static_assert(!registry::contains_type_v<char,  TestTuple>, "Should not contain char");
 
-    std::cout << "  Tuple utilities: PASS\n";
+    RTLOG_INFO(g_logger) << "  Tuple utilities: PASS";
 }
 
 void test_message_def_lookup() {
-    std::cout << "Testing MessageDef lookup...\n";
+    RTLOG_INFO(g_logger) << "Testing MessageDef lookup...";
 
     using TempDef = registry::find_message_def_t<TemperatureData, TestRegistry>;
     static_assert(!std::is_same_v<TempDef, void>, "Should find TemperatureData def");
@@ -196,7 +203,7 @@ void test_message_def_lookup() {
     static_assert(!registry::is_request_payload_v<TemperatureData, TestRegistry>,
                   "TemperatureData is not a request payload");
 
-    std::cout << "  MessageDef lookup: PASS\n";
+    RTLOG_INFO(g_logger) << "  MessageDef lookup: PASS";
 }
 
 // ============================================================================
@@ -204,7 +211,10 @@ void test_message_def_lookup() {
 // ============================================================================
 
 int main() {
-    std::cout << "\n=== CoreRaT registry_utils test suite ===\n\n";
+    g_logger.add_sink(&g_sink);
+    g_logger.start_drain();
+
+    RTLOG_INFO(g_logger) << "=== CoreRaT registry_utils test suite ===";
 
     test_category_filters();
     test_prefix_filters();
@@ -216,6 +226,7 @@ int main() {
     test_tuple_utilities();
     test_message_def_lookup();
 
-    std::cout << "\n=== ALL TESTS PASSED ===\n\n";
+    RTLOG_INFO(g_logger) << "=== ALL TESTS PASSED ===";
+    g_logger.stop_drain();
     return 0;
 }
