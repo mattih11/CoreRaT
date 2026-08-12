@@ -87,6 +87,12 @@ public:
         });
     }
 
+    template<typename Func>
+    void start(const ThreadConfig& config, Func&& func) {
+        config_ = config;
+        start(std::forward<Func>(func));
+    }
+
     void join() {
         if (thread_.joinable()) {
             thread_.join();
