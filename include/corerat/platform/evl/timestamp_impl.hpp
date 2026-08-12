@@ -100,7 +100,23 @@ public:
         if (ns == 0) return;
         // evl_usleep() max is 1,000,000 us (1 second); use sleep_until for longer
         if (ns <= 1'000'000'000ULL) {
-            evl_usleep(static_cast<useconds_t>(ns / 1'000U));
+            const int r = evl_usleep(static_cast<useconds_t>(ns / 1'000U));
+            if (r != 0) {
+                // -EPERM (-1): thread not EVL-attached — fall back to nanosleep
+                // -EINTR (-4): interrupted by signal — return immediately (caller retries)
+                if (r == -EPERM) {
+                    char ebuf[96];
+                    const int n = std::snprintf(ebuf, sizeof(ebuf),
+                        "[corerat] evl_usleep(%u us) failed: %d (thread not OOB-attached)\n",
+                        static_cast<unsigned>(ns / 1'000U), r);
+                    ::write(STDERR_FILENO, ebuf, static_cast<std::size_t>(n));
+                    struct timespec ts{
+                        static_cast<time_t>(ns / 1'000'000'000ULL),
+                        static_cast<long>(ns % 1'000'000'000ULL)
+                    };
+                    nanosleep(&ts, nullptr);
+                }
+            }
         } else {
             Timestamp target = now() + ns;
             sleep_until(target);

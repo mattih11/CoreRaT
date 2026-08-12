@@ -144,11 +144,21 @@ private:
         auto func = std::move(ctx->func);
         delete ctx;  // Free before entering RT loop
 
-        // Attach to EVL core (enables OOB scheduling)
+        // evl_attach_self() serves as both EVL initialisation and thread attachment.
+        // It is documented as a valid indirect initialisation path (no prior evl_init() needed).
+        // Error codes:
+        //   >= 0  : success (efd is the thread element fd)
+        //   -EBUSY: thread already attached — treat as success, retrieve fd via evl_get_self()
+        //   -EPERM: EVL core not loaded or no permission (CAP_SYS_ADMIN / kernel not patched)
+        //   -ENOMEM: out of kernel memory
         char name[64];
         std::snprintf(name, sizeof(name), "corerat-%s:%d",
                       cfg.name.substr(0, 40).c_str(), static_cast<int>(getpid()));
         int efd = evl_attach_self("%s", name);
+        if (efd == -EBUSY) {
+            // Already attached on this thread (e.g. nested start() call) — retrieve existing fd.
+            efd = evl_get_self();
+        }
         if (efd >= 0) {
             if (cfg.priority != ThreadPriority::IDLE) {
                 struct evl_sched_attrs attrs;
@@ -160,6 +170,19 @@ private:
 
             // Enable health monitoring: warn on accidental in-band switches
             evl_set_thread_mode(efd, EVL_T_WOSS | EVL_T_HMSIG, nullptr);
+        } else {
+            // Fatal: EVL core is unavailable — OOB scheduling and OOB sleep will not work.
+            // Most likely cause: kernel not built with Dovetail/EVL support, or missing
+            // CAP_SYS_ADMIN. The thread still runs in-band; timer periods will be inaccurate.
+            char ebuf[160];
+            const char* reason = (efd == -EPERM)  ? "EVL core unavailable or no permission" :
+                                 (efd == -ENOMEM) ? "kernel out of memory" :
+                                                    "unknown error";
+            const int n = std::snprintf(ebuf, sizeof(ebuf),
+                "[corerat] evl_attach_self(\"%s\") = %d: %s "
+                "-- thread will run in-band, OOB sleep disabled\n",
+                name, efd, reason);
+            ::write(STDERR_FILENO, ebuf, static_cast<std::size_t>(n));
         }
 
         if (cfg.cpu_affinity >= 0) {
