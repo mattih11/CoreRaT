@@ -143,6 +143,9 @@ jobs:
             .evl-cache/.cache_key
           key: ratos-qemu-${{ env.RATOS_RELEASE_TAG }}
 
+      - name: Enable KVM access
+        run: sudo chmod 666 /dev/kvm
+
       - name: Cross-compile and run tests in QEMU
         env:
           RATOS_RELEASE_TOKEN: ${{ secrets.RATOS_RELEASE_TOKEN }}
