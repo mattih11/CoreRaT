@@ -8,7 +8,7 @@
  *
  *   LOCAL  — single-process / multi-thread (default).
  *            Ring buffer lives in heap memory.
- *            Routing via evl_detail::registry_slot[] (process-local pointer table).
+ *            Routing via evl_detail::registry_find/insert (process-local hash table).
  *
  *   PUBLIC — cross-process.
  *            Ring buffer lives in a POSIX SHM region ("/corerat_mbx_<id>").
@@ -66,10 +66,75 @@ namespace evl_detail {
 
 inline constexpr uint32_t kMaxMailboxes = 256;
 
-/// Process-local registry: mailbox_id → EvlMailbox* (LOCAL mode only).
-inline EvlMailbox*& registry_slot(uint32_t id) noexcept {
-    static EvlMailbox* reg[kMaxMailboxes]{};
-    return reg[id % kMaxMailboxes];
+// ============================================================================
+// Process-local registry — open-addressing hash table keyed on full 32-bit ID
+//
+// CommRaT mailbox IDs have the form [type:8][sys:8][inst:8][idx:8].
+// Using id % N as a hash would collide on the mailbox_index byte (all WORK
+// mailboxes share idx=1, all CMD share idx=0, etc.).  A multiplicative hash
+// mixes all four bytes so each unique ID lands in a distinct slot.
+//
+// Capacity: kRegistryCapacity slots (must be power-of-2, ≥ 2 * kMaxMailboxes
+// to keep load factor below 50 % and minimise probing depth).
+//
+// Deletion: sets ptr=nullptr, keeps id as tombstone so probe chains stay intact.
+// ============================================================================
+
+inline constexpr uint32_t kRegistryCapacity = 512;  // power-of-2, load < 50%
+
+struct RegistryEntry {
+    uint32_t    id{0};
+    EvlMailbox* ptr{nullptr};
+};
+
+inline std::array<RegistryEntry, kRegistryCapacity>& registry_table() noexcept {
+    static std::array<RegistryEntry, kRegistryCapacity> tbl{};
+    return tbl;
+}
+
+/// Knuth multiplicative hash — mixes all 32 bits into a slot index.
+inline constexpr uint32_t registry_hash(uint32_t id) noexcept {
+    return (id * 2654435761u) >> (32u - 9u);  // top 9 bits → 0..511
+}
+
+/// Insert or update an entry for id.
+inline void registry_insert(uint32_t id, EvlMailbox* ptr) noexcept {
+    auto& tbl = registry_table();
+    uint32_t h = registry_hash(id);
+    for (uint32_t i = 0; i < kRegistryCapacity; ++i) {
+        uint32_t slot = (h + i) & (kRegistryCapacity - 1u);
+        if (tbl[slot].id == 0 || tbl[slot].id == id) {
+            tbl[slot] = {id, ptr};
+            return;
+        }
+    }
+    // Table full (should never happen with load < 50%).
+}
+
+/// Clear the entry for id (tombstone: keeps id so probe chain is intact).
+inline void registry_remove(uint32_t id) noexcept {
+    auto& tbl = registry_table();
+    uint32_t h = registry_hash(id);
+    for (uint32_t i = 0; i < kRegistryCapacity; ++i) {
+        uint32_t slot = (h + i) & (kRegistryCapacity - 1u);
+        if (tbl[slot].id == 0) return;   // not found
+        if (tbl[slot].id == id) {
+            tbl[slot].ptr = nullptr;      // tombstone
+            return;
+        }
+    }
+}
+
+/// Look up a mailbox by full 32-bit ID.  Returns nullptr if not found.
+inline EvlMailbox* registry_find(uint32_t id) noexcept {
+    auto& tbl = registry_table();
+    uint32_t h = registry_hash(id);
+    for (uint32_t i = 0; i < kRegistryCapacity; ++i) {
+        uint32_t slot = (h + i) & (kRegistryCapacity - 1u);
+        if (tbl[slot].id == 0) return nullptr;  // empty → not found
+        if (tbl[slot].id == id) return tbl[slot].ptr;
+    }
+    return nullptr;
 }
 
 /// Build an EVL object name into a fixed buffer.
@@ -225,7 +290,7 @@ public:
         if (!create_evl_objects())             return TimsResult::ERROR_INIT;
 
         if (mode_ == Mode::Local)
-            evl_detail::registry_slot(config_.mailbox_id) = this;
+            evl_detail::registry_insert(config_.mailbox_id, this);
 
         // Public mode: create a PUBLIC xbuf so corerat-router-evl can bridge
         // in-band (STD) senders to this OOB mailbox without touching the EVL
@@ -254,8 +319,8 @@ public:
         close_all_remotes();
 
         if (mode_ == Mode::Local &&
-            evl_detail::registry_slot(config_.mailbox_id) == this)
-            evl_detail::registry_slot(config_.mailbox_id) = nullptr;
+            evl_detail::registry_find(config_.mailbox_id) == this)
+            evl_detail::registry_remove(config_.mailbox_id);
 
         if (xbuf_fd_ >= 0) { ::close(xbuf_fd_); xbuf_fd_ = -1; }
         if (poll_fd_ >= 0) { ::close(poll_fd_); poll_fd_ = -1; }
@@ -906,7 +971,7 @@ private:
 
         if (mode_ == Mode::Public) {
             // Same-process shortcut (both mailboxes are PUBLIC, same process)
-            EvlMailbox* local = evl_detail::registry_slot(dest);
+            EvlMailbox* local = evl_detail::registry_find(dest);
             if (local && local->get_mailbox_id() == dest && local->created_) {
                 ok = local->post(data, size, priority, config_.mailbox_id);
             } else {
@@ -929,7 +994,7 @@ private:
             }
         } else {
             // LOCAL: process-local registry only
-            EvlMailbox* target = evl_detail::registry_slot(dest);
+            EvlMailbox* target = evl_detail::registry_find(dest);
             if (!target || target->get_mailbox_id() != dest || !target->created_)
                 return TimsResult::ERROR_SEND;
             ok = target->post(data, size, priority, config_.mailbox_id);
