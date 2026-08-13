@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(CoreRaT VERSION 0.1.3 LANGUAGES CXX)
+project(CoreRaT VERSION 0.1.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,10 +78,14 @@ target_compile_definitions(corerat INTERFACE
     CORERAT_PLATFORM_${CORERAT_PLATFORM}
 )
 
+# -march=native is intentionally NOT set here: corerat is an installed INTERFACE
+# library whose compile flags propagate to every downstream consumer.  A native-
+# tuned binary cannot be distributed — it will SIGILL on machines without the
+# same ISA extensions.  Callers that want -march=native for local developer builds
+# should add it to their own target or pass -DCMAKE_CXX_FLAGS=-march=native.
 target_compile_options(corerat INTERFACE
     -Wall -Wextra -Wpedantic
     $<$<CONFIG:Release>:-O3>
-    $<$<AND:$<CONFIG:Release>,$<STREQUAL:${CORERAT_PLATFORM},STD>>:-march=native>
 )
 
 if(CORERAT_PLATFORM STREQUAL "EVL")
@@ -129,6 +133,12 @@ endif()
 # Router binaries
 # ============================================================================
 
+# Optional ISA baseline for router binaries — defaults to empty (compiler default).
+# Set to e.g. -march=x86-64-v3 for portable release packages (AVX2, no AVX-512).
+# Never set this to -march=native for distributed binaries.
+set(CORERAT_ROUTER_MARCH_FLAGS "" CACHE STRING
+    "Extra -march flags applied only to router executables (e.g. -march=x86-64-v3)")
+
 if(CORERAT_BUILD_ROUTERS)
     # TCP router — always available (no extra dependencies)
     add_executable(corerat-router-tcp src/router/tcp_router.cpp)
@@ -142,6 +152,11 @@ if(CORERAT_BUILD_ROUTERS)
     add_executable(corerat-router-evl src/router/evl_router.cpp)
     target_link_libraries(corerat-router-evl PRIVATE corerat)
     install(TARGETS corerat-router-evl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+    if(CORERAT_ROUTER_MARCH_FLAGS)
+        target_compile_options(corerat-router-tcp PRIVATE ${CORERAT_ROUTER_MARCH_FLAGS})
+        target_compile_options(corerat-router-evl  PRIVATE ${CORERAT_ROUTER_MARCH_FLAGS})
+    endif()
 endif()
 
 # ============================================================================

@@ -194,7 +194,13 @@ jobs:
           sudo dpkg -i /tmp/pkgs/sertial_*_amd64.deb
 
       - name: Configure
-        run: cmake --preset default -DCMAKE_INSTALL_PREFIX=/usr/local
+        # -march=x86-64-v3: portable AVX2/BMI2 baseline for distributed binaries.
+        # Applied only to router executables (CORERAT_ROUTER_MARCH_FLAGS), never
+        # to the INTERFACE library target (which would propagate to all consumers).
+        run: >
+          cmake --preset default
+          -DCMAKE_INSTALL_PREFIX=/usr/local
+          -DCORERAT_ROUTER_MARCH_FLAGS="-march=x86-64-v3"
 
       - name: Build
         run: cmake --build --preset default --parallel $(nproc)
