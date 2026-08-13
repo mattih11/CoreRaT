@@ -34,6 +34,8 @@ jobs:
         run: |
           tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
           echo "RATOS_RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
+          sertial_tag=$(grep '^SERTIAL_RELEASE_TAG=' .corerat.env | cut -d= -f2)
+          echo "SERTIAL_RELEASE_TAG=${sertial_tag}" >> "$GITHUB_ENV"
 
       - name: Install reflectcpp
         env:
@@ -48,7 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download --repo mattih11/SeRTial \
+          gh release download "${{ env.SERTIAL_RELEASE_TAG }}" --repo mattih11/SeRTial \
             --pattern "sertial_*_amd64.deb" --dir /tmp/pkgs
           sudo dpkg -i /tmp/pkgs/sertial_*_amd64.deb
 
@@ -171,6 +173,8 @@ jobs:
         run: |
           tag=$(grep '^RATOS_RELEASE_TAG=' .corerat.env | cut -d= -f2)
           echo "RATOS_RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
+          sertial_tag=$(grep '^SERTIAL_RELEASE_TAG=' .corerat.env | cut -d= -f2)
+          echo "SERTIAL_RELEASE_TAG=${sertial_tag}" >> "$GITHUB_ENV"
 
       - name: Install reflectcpp
         env:
@@ -185,7 +189,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download --repo mattih11/SeRTial \
+          gh release download "${{ env.SERTIAL_RELEASE_TAG }}" --repo mattih11/SeRTial \
             --pattern "sertial_*_amd64.deb" --dir /tmp/pkgs
           sudo dpkg -i /tmp/pkgs/sertial_*_amd64.deb
 
