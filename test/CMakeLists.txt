@@ -17,6 +17,7 @@ endfunction()
 # Unit tests
 # ============================================================================
 
+corerat_test(test_file)
 corerat_test(test_message_id)
 corerat_test(test_registry_utils)
 corerat_test(test_wire_message_sizing)
