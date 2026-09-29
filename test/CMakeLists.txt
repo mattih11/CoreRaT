@@ -113,9 +113,11 @@ elseif(CORERAT_IPC STREQUAL "EVL")
 endif()
 
 # ---- EVL single-binary LOCAL-mode latency benchmark ----
-if(CORERAT_PLATFORM STREQUAL "EVL")
+# Requires the EVL IPC backend: corerat_evl carries CORERAT_IPC_EVL, without which
+# evl_pingpong compiles to a stub that exits non-zero.
+if(CORERAT_PLATFORM STREQUAL "EVL" AND CORERAT_IPC STREQUAL "EVL")
     add_executable(evl_pingpong ping_pong/evl_pingpong.cpp)
-    target_link_libraries(evl_pingpong PRIVATE corerat)
+    target_link_libraries(evl_pingpong PRIVATE corerat corerat_evl)
     target_include_directories(evl_pingpong PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ping_pong)
 
     add_test(NAME test_evl_pingpong
