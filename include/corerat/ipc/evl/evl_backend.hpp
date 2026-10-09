@@ -170,6 +170,25 @@ inline void attach_this_thread() noexcept {
                                     static_cast<int>(gettid()));
     (void)(r == 0 || r == -EBUSY);  // any other error is non-fatal here
 }
+
+class InbandScope {
+public:
+    InbandScope() noexcept
+        : restore_oob_(!evl_is_inband())
+        , switched_(restore_oob_ ? evl_switch_inband() == 0 : true) {}
+
+    ~InbandScope() {
+        if (restore_oob_ && switched_) {
+            evl_switch_oob();
+        }
+    }
+
+    [[nodiscard]] bool switched() const noexcept { return switched_; }
+
+private:
+    bool restore_oob_;
+    bool switched_;
+};
 #endif
 
 }  // namespace evl_detail
@@ -861,6 +880,8 @@ private:
     bool open_remote(RemoteHandle& h, uint32_t dest) noexcept {
 #ifdef CORERAT_PLATFORM_EVL
         evl_detail::attach_this_thread();
+        evl_detail::InbandScope inband_scope;
+        if (!inband_scope.switched()) return false;
 #endif
         char name_buf[64];
         evl_detail::shm_name(name_buf, dest);
