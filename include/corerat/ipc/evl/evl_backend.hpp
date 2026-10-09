@@ -175,11 +175,26 @@ class InbandScope {
 public:
     InbandScope() noexcept
         : restore_oob_(!evl_is_inband())
-        , switched_(restore_oob_ ? evl_switch_inband() == 0 : true) {}
+        , self_fd_(restore_oob_ ? evl_get_self() : -1)
+        , switched_(!restore_oob_) {
+        if (!restore_oob_ || self_fd_ < 0) return;
+
+        int old_mode = 0;
+        if (evl_clear_thread_mode(self_fd_, EVL_T_HMSIG, &old_mode) != 0) return;
+
+        restore_hmsig_ = (old_mode & EVL_T_HMSIG) != 0;
+        switched_ = evl_switch_inband() == 0;
+        if (!switched_ && restore_hmsig_) {
+            evl_set_thread_mode(self_fd_, EVL_T_HMSIG, nullptr);
+        }
+    }
 
     ~InbandScope() {
         if (restore_oob_ && switched_) {
             evl_switch_oob();
+        }
+        if (restore_hmsig_) {
+            evl_set_thread_mode(self_fd_, EVL_T_HMSIG, nullptr);
         }
     }
 
@@ -187,6 +202,8 @@ public:
 
 private:
     bool restore_oob_;
+    int self_fd_;
+    bool restore_hmsig_{false};
     bool switched_;
 };
 #endif
