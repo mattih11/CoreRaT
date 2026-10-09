@@ -276,7 +276,7 @@ public:
     void unlock_shared()     { evl_unlock_read(&evl_rwlock_); }
 
 private:
-    struct evl_rwlock evl_rwlock_;
+    struct evl_rwlock evl_rwlock_ = EVL_RWLOCK_INITIALIZER();
 };
 
 // ============================================================================
